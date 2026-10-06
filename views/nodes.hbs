@@ -1,0 +1,64 @@
+{{> page-header heading="NODES" sub="Docker hosts that run Craftly servers."}}
+
+<div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+  <div class="help">Release Docker node registry and provisioning agent. Remote nodes authenticate with a dedicated bearer token; the local node uses this panel's Docker Engine.</div>
+  <button class="btn" id="node-refresh">Refresh</button>
+</div>
+
+<div id="node-token-notice" class="notice notice-warn mb-5 hidden"></div>
+
+<div class="grid gap-4 lg:grid-cols-2" id="nodes-list">
+  {{#each nodes}}
+    <article class="card" data-node-id="{{id}}">
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <div class="flex items-center gap-2">
+            <span class="status-dot {{#if (eq status 'online')}}bg-grass-500{{else if (eq status 'degraded')}}bg-gold-500{{else if (eq status 'disabled')}}bg-stone-500{{else}}bg-redstone-500{{/if}}"></span>
+            <h2 class="truncate text-base font-semibold">{{name}}</h2>
+          </div>
+          <p class="mt-1 text-sm text-ink-soft">{{description}}</p>
+        </div>
+        <span class="badge">{{status}}</span>
+      </div>
+      <dl class="mt-5 grid grid-cols-2 gap-4 text-sm">
+        <div><dt class="text-xs text-ink-faint">Endpoint</dt><dd class="font-mono">{{scheme}}://{{fqdn}}:{{daemon_port}}</dd></div>
+        <div><dt class="text-xs text-ink-faint">SFTP</dt><dd class="font-mono">{{sftp_port}}</dd></div>
+        <div><dt class="text-xs text-ink-faint">Mode</dt><dd>{{mode}}</dd></div>
+        <div><dt class="text-xs text-ink-faint">Docker</dt><dd>{{default docker_version "Not reported"}}</dd></div>
+        <div><dt class="text-xs text-ink-faint">CPUs</dt><dd>{{default docker_cpus "-"}}</dd></div>
+        <div><dt class="text-xs text-ink-faint">Last heartbeat</dt><dd>{{default last_seen_at "Never"}}</dd></div>
+        <div><dt class="text-xs text-ink-faint">Data root</dt><dd class="font-mono">{{data_root}}</dd></div>
+      </dl>
+      {{#if last_error}}<div class="notice notice-danger mt-4">{{last_error}}</div>{{/if}}
+      <div class="mt-5 flex flex-wrap gap-2">
+        {{#if enabled}}
+          <button class="btn btn-ghost" data-node-disable="{{id}}">Disable</button>
+        {{else}}
+          <button class="btn" data-node-enable="{{id}}">Enable</button>
+        {{/if}}
+        {{#unless (eq id 'local')}}
+          <button class="btn btn-ghost" data-node-rotate="{{id}}">Rotate token</button>
+          <button class="btn btn-ghost" data-node-delete="{{id}}">Delete</button>
+        {{/unless}}
+      </div>
+    </article>
+  {{else}}
+    <div class="card"><p class="help">No nodes are registered yet.</p></div>
+  {{/each}}
+</div>
+
+<section class="card mt-6">
+  <h2 class="font-semibold">Register remote Docker node</h2>
+  <p class="help mt-1">Creates a node identity and one-time authentication token. The token is never stored in plaintext.</p>
+  <form id="node-create" class="mt-5 grid gap-4 sm:grid-cols-2">
+    <input class="input" name="name" required maxlength="64" placeholder="Node name">
+    <input class="input" name="fqdn" required maxlength="255" placeholder="node.example.com">
+    <input class="input" name="daemonPort" type="number" min="1" max="65535" value="8080" placeholder="Daemon port">
+    <input class="input" name="sftpPort" type="number" min="1" max="65535" value="2022" placeholder="SFTP port">
+    <input class="input" name="dataRoot" value="/var/lib/craftly" maxlength="500" placeholder="Node data root">
+    <input class="input sm:col-span-2" name="description" maxlength="500" placeholder="Description (optional)">
+    <div class="sm:col-span-2"><button class="btn" type="submit">Register node</button><p class="help mt-2">After registration, run <code>node node-agent/agent.js</code> on the Docker host with the generated node token.</p></div>
+  </form>
+</section>
+
+<script type="module" src="/js/pages/nodes.js"></script>

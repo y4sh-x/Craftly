@@ -1,0 +1,861 @@
+// Mods tab: add-by-link, registry search modal (Modrinth/CurseForge/Hangar/
+// SpigotMC), zip + mrpack import, toggle, delete.
+import { toast } from '../lib/toast.js';
+import { openModal } from '../lib/modal.js';
+import { confirmDialog } from '../lib/confirm.js';
+import { setBusy, withBusy } from '../lib/loading.js';
+import { runTask } from '../lib/progress.js';
+import { showZipImportReport } from '../lib/zipImport.js';
+
+// Escape a value for safe interpolation into an HTML attribute (Modrinth icon
+// URLs are third-party mod-author data — an unescaped `"` breaks out of src="").
+const escAttr = (s) =>
+  String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+const root = document.querySelector('[data-mods-server]');
+if (root)
+  init(
+    root.dataset.modsServer,
+    root.dataset.modsType,
+    root.dataset.modsMc,
+    root.dataset.modsLoader,
+    root.dataset.modsCf === 'true'
+  );
+
+function init(serverId, serverType, mcVersion, serverLoader, cfEnabled) {
+  const mc = (mcVersion || '').replace(/^(LATEST|SNAPSHOT) \((.+)\)$/, '$2');
+  const contentKind = ['PAPER', 'PURPUR', 'SPIGOT', 'BUKKIT', 'FOLIA', 'LEAF', 'PUFFERFISH', 'CANYON'].includes(
+    serverType
+  )
+    ? 'plugin'
+    : 'mod';
+  // CF page section differs for plugins; also used for "open in browser" fallbacks.
+  const cfSection = contentKind === 'plugin' ? 'bukkit-plugins' : 'mc-mods';
+
+  // ---- Filters ----
+  const filter = document.getElementById('mods-filter');
+  const source = document.getElementById('mods-source');
+  function refilter() {
+    const q = (filter.value || '').toLowerCase();
+    const src = source.value;
+    document.querySelectorAll('[data-mod-row]').forEach((row) => {
+      // Match name/file only — full row text includes button labels and status
+      // words, so searching "disable" or "update" matched virtually every row.
+      const hay = `${row.dataset.name || ''} ${row.dataset.file || ''}`.toLowerCase();
+      const matches = (!q || hay.includes(q)) && (!src || row.dataset.source === src);
+      row.classList.toggle('hidden', !matches);
+    });
+  }
+  filter?.addEventListener('input', refilter);
+  source?.addEventListener('change', refilter);
+
+  // ---- Row actions ----
+  document.getElementById('mods-table')?.addEventListener('click', async (e) => {
+    const row = e.target.closest('[data-mod-row]');
+    if (!row) return;
+    const file = row.dataset.file;
+
+    if (e.target.closest('[data-mod-update]')) {
+      const btn = e.target.closest('[data-mod-update]');
+      const res = await withBusy(btn, 'Updating…', () => post(`/api/servers/${serverId}/mods/update`, { file }));
+      if (res) {
+        const inst = res.installed || {};
+        toast(
+          `Updated to ${inst.name || file}${inst.version ? ` ${inst.version}` : ''}.` +
+            (res.restarted ? ' Restarting the server.' : '')
+        );
+        setTimeout(() => location.reload(), 700);
+      }
+    } else if (e.target.closest('[data-mod-revert]')) {
+      const btn = e.target.closest('[data-mod-revert]');
+      const to = btn.dataset.revertTo;
+      const ok = await confirmDialog({
+        title: 'Go back to the earlier build?',
+        message: `${row.dataset.name || file} goes back to ${to}, and that build stops being offered as an update until a newer one appears. The server restarts if it is running.`,
+        confirmLabel: 'Revert',
+      });
+      if (!ok) return;
+      const res = await withBusy(btn, 'Reverting…', () => post(`/api/servers/${serverId}/mods/revert`, { file }));
+      if (res) {
+        const inst = res.installed || {};
+        toast(
+          `Reverted to ${inst.name || file}${inst.version ? ` ${inst.version}` : ''}.` +
+            (res.restarted ? ' Restarting the server.' : '')
+        );
+        setTimeout(() => location.reload(), 700);
+      }
+    } else if (e.target.closest('[data-mod-ignore-update]')) {
+      const btn = e.target.closest('[data-mod-ignore-update]');
+      const res = await withBusy(btn, () =>
+        post(`/api/servers/${serverId}/mods/ignore-update`, { file, ignore: true })
+      );
+      if (res) {
+        toast(`Update ignored for ${row.dataset.name || file}.`, { kind: 'success' });
+        setTimeout(() => location.reload(), 600);
+      }
+    } else if (e.target.closest('[data-mod-unignore-update]')) {
+      const btn = e.target.closest('[data-mod-unignore-update]');
+      const res = await withBusy(btn, () =>
+        post(`/api/servers/${serverId}/mods/ignore-update`, { file, ignore: false })
+      );
+      if (res) {
+        toast(`Update no longer ignored for ${row.dataset.name || file}.`, { kind: 'success' });
+        setTimeout(() => location.reload(), 600);
+      }
+    } else if (e.target.closest('[data-mod-toggle]')) {
+      const btn = e.target.closest('[data-mod-toggle]');
+      const enable = row.dataset.enabled !== 'true';
+      const res = await withBusy(btn, () => post(`/api/servers/${serverId}/mods/toggle`, { file, enabled: enable }));
+      if (res) {
+        toast(
+          res.applied === 'instant'
+            ? `${file} ${enable ? 'enabled' : 'disabled'}.`
+            : `${file} ${enable ? 're-included' : 'excluded'}: applies on next restart.`,
+          { kind: 'success' }
+        );
+        setTimeout(() => location.reload(), 600);
+      }
+    } else if (e.target.closest('[data-mod-delete]')) {
+      const btn = e.target.closest('[data-mod-delete]');
+      const ok = await confirmDialog({
+        title: `Delete ${file}?`,
+        message: 'Removes the file from this server. The shared library copy stays for other servers.',
+        confirmLabel: 'Delete',
+        danger: true,
+      });
+      if (!ok) return;
+      const restore = setBusy(btn);
+      try {
+        const res = await fetch(`/api/servers/${serverId}/mods/${encodeURIComponent(file)}`, { method: 'DELETE' });
+        const data = await res.json().catch(() => ({}));
+        if (data.ok) {
+          toast(`${file} removed.`);
+          const tbody = row.closest('tbody');
+          row.remove();
+          // Last row gone → re-render for the proper empty state.
+          if (tbody && !tbody.querySelector('[data-mod-row]')) setTimeout(() => location.reload(), 600);
+        } else {
+          toast(data.error || 'That file could not be deleted. Please try again.', { kind: 'error' });
+        }
+      } finally {
+        restore();
+      }
+    }
+  });
+
+  // ---- Add by URL ----
+  // Shared "installed despite a compatibility check being overridden" toast text
+  // - both Add by URL and the search results' Install button hit this.
+  function overrideNote(installed) {
+    const bits = [];
+    if (installed && installed.versionOverridden) bits.push(`isn't listed as compatible with ${mc}`);
+    if (installed && installed.loaderOverridden) bits.push("isn't built for this server's loader");
+    return bits.length ? `This build ${bits.join(' and ')}, but was installed anyway.` : '';
+  }
+
+  document.getElementById('mods-add-url')?.addEventListener('click', () => {
+    const content = document.createElement('div');
+    content.innerHTML = `
+      <label class="label">Mod URL or Modrinth slug</label>
+      <input class="input font-mono" id="mod-url" placeholder="https://modrinth.com/mod/sodium" autocomplete="off">
+      <p class="help">Paste almost any link: Modrinth, CurseForge, Hangar, or SpigotMC project pages, a GitHub repo or release ("owner/repo" works too), a Modrinth slug, or a direct .jar URL. The right build for this server's loader and MC version is picked automatically.</p>
+      <label class="label mt-3">Content type</label>
+      <select class="input" id="mod-url-kind" data-label="Content type">
+        <option value="">Auto-detect</option>
+        <option value="mod">Mod</option>
+        <option value="plugin">Plugin</option>
+        <option value="datapack">Datapack</option>
+        <option value="resourcepack">Resource pack</option>
+      </select>
+      <p class="help">Leave on Auto-detect unless a link installs as the wrong type. Some datapacks are published under a "mod" project.</p>
+      ${
+        mc && !mc.startsWith('LATEST')
+          ? `<label class="mt-3 flex cursor-pointer items-start gap-2 text-sm">
+               <input type="checkbox" class="craftly-check mt-0.5" id="mod-url-ignore-version">
+               <span>Install even if the build isn't listed as compatible with ${escAttr(mc)} or this server's loader.</span>
+             </label>`
+          : ''
+      }
+      <div class="mt-3 hidden" id="mod-url-progress"><div class="meter meter-indeterminate"><div class="bg-grass-500" style="width:25%"></div></div></div>`;
+    const modal = openModal({
+      title: 'Add Mod by URL',
+      content,
+      actions: [
+        { label: 'Cancel', kind: 'ghost' },
+        {
+          label: 'Download & Install',
+          kind: 'primary',
+          busyLabel: 'Installing…',
+          onClick: async () => {
+            const url = content.querySelector('#mod-url').value.trim();
+            if (!url) return false;
+            const kind = content.querySelector('#mod-url-kind').value;
+            const ignoreVersion = Boolean(content.querySelector('#mod-url-ignore-version')?.checked);
+            const progress = content.querySelector('#mod-url-progress');
+            progress.classList.remove('hidden');
+            const res = await post(`/api/servers/${serverId}/mods`, { url, ...(kind ? { kind } : {}), ignoreVersion });
+            if (!res) {
+              progress.classList.add('hidden'); // failure keeps the modal open - no zombie meter
+              return false;
+            }
+            const note = overrideNote(res.installed);
+            toast(
+              `Installed ${res.installed.name}${res.installed.version ? ` ${res.installed.version}` : ''}.${note ? ` ${note}` : ''}`,
+              note ? { kind: 'warn', timeout: 9000 } : undefined
+            );
+            setTimeout(() => location.reload(), 700);
+          },
+        },
+      ],
+    });
+    modal.body.querySelector('#mod-url').focus();
+  });
+
+  // ---- Import zip: .mrpack / CurseForge modpack export / hand-assembled jar zip ----
+  const zipInput = document.createElement('input');
+  zipInput.type = 'file';
+  zipInput.accept = '.zip,.mrpack';
+  zipInput.className = 'hidden';
+  document.body.appendChild(zipInput);
+  document.getElementById('mods-import-zip')?.addEventListener('click', () => zipInput.click());
+  zipInput.addEventListener('change', async () => {
+    if (!zipInput.files.length) return;
+    const file = zipInput.files[0];
+    zipInput.value = '';
+    const btn = document.getElementById('mods-import-zip');
+    const restore = setBusy(btn, 'Reading zip…');
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await fetch(`/api/servers/${serverId}/mods/import-zip/preview`, { method: 'POST', body: fd });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || `Preview failed (${res.status})`);
+      openZipPreview(data.preview, data.uploadToken);
+    } catch (err) {
+      toast(err.message, { kind: 'error', timeout: 9000 });
+    } finally {
+      restore();
+    }
+  });
+
+  const verdictBadge = (v) => {
+    if (!v) return '';
+    if (v.status === 'ok')
+      return v.mcOk === null
+        ? '<span class="badge" data-tip="Loader matches; MC version could not be verified">fits (MC unverified)</span>'
+        : '<span class="badge badge-ok">fits this server</span>';
+    if (v.status === 'wrong-loader') return '<span class="badge badge-warn">wrong loader</span>';
+    if (v.status === 'wrong-mc') return '<span class="badge badge-warn">wrong MC version</span>';
+    if (v.status === 'wrong-kind') return '<span class="badge badge-warn">wrong content type</span>';
+    return '<span class="badge" data-tip="Not found on Modrinth/CurseForge and no readable metadata">unidentified</span>';
+  };
+
+  function openZipPreview(preview, uploadToken) {
+    const isMrpack = preview.type === 'mrpack';
+    const isPack = preview.type === 'curseforge-pack' || isMrpack;
+    const content = document.createElement('div');
+    const head = document.createElement('div');
+    if (isPack) {
+      head.className = 'mb-3 text-sm';
+      head.innerHTML = `<div class="font-semibold" data-role="packname"></div>
+        <div class="text-xs text-ink-faint" data-role="packmeta"></div>`;
+      head.querySelector('[data-role="packname"]').textContent =
+        `${preview.pack.name}${preview.pack.version ? ` ${preview.pack.version}` : ''}`;
+      head.querySelector('[data-role="packmeta"]').textContent =
+        `${isMrpack ? 'Modrinth modpack (.mrpack)' : 'CurseForge modpack export'}, Minecraft ${preview.pack.mcVersion || '?'}, ${preview.pack.loader || 'unknown loader'}`;
+    } else {
+      head.className = 'mb-3 text-sm text-ink-soft';
+      head.textContent = `${preview.items.length} jar${preview.items.length === 1 ? '' : 's'} found; each was identified via Modrinth, CurseForge, or its own metadata and checked against this server.`;
+    }
+    content.appendChild(head);
+
+    for (const w of preview.warnings || []) {
+      const n = document.createElement('div');
+      n.className = 'notice notice-warn mb-2 text-xs text-warn';
+      n.textContent = w;
+      content.appendChild(n);
+    }
+
+    const list = document.createElement('div');
+    list.className = 'max-h-80 space-y-1.5 overflow-y-auto';
+    content.appendChild(list);
+
+    const blocked = isPack ? preview.items.filter((i) => i.resolved && !i.downloadable) : [];
+    const rows = [];
+    for (const item of preview.items) {
+      const isBlocked = isPack && item.resolved && !item.downloadable;
+      const missing = isPack && !item.resolved;
+      const row = document.createElement('label');
+      row.className = 'flex items-center gap-2.5 rounded-md border border-line bg-raised p-2 text-sm';
+      const checked = isPack
+        ? item.resolved && item.downloadable && !item.installed
+        : item.verdict && item.verdict.status === 'ok' && !item.installed;
+      row.innerHTML = `
+        <input type="checkbox" class="craftly-check shrink-0" ${checked ? 'checked' : ''} ${isBlocked || missing ? 'disabled' : ''}>
+        <span class="min-w-0 flex-1">
+          <span class="block truncate font-medium" data-role="name"></span>
+          <span class="block truncate text-xs text-ink-faint" data-role="sub"></span>
+        </span>
+        <span class="flex shrink-0 items-center gap-1.5" data-role="badges"></span>`;
+      const idn = isPack ? item : item.identity || {};
+      row.querySelector('[data-role="name"]').textContent =
+        idn.name || item.filename || item.entry || `Project ${item.projectId}`;
+      row.querySelector('[data-role="sub"]').textContent = isPack
+        ? item.fileName || (missing ? 'file no longer exists on CurseForge' : '')
+        : `${item.filename}${idn.version ? `, ${idn.version}` : ''}${idn.source ? ` · via ${idn.source}` : ''}`;
+      const badges = row.querySelector('[data-role="badges"]');
+      if (item.installed) badges.insertAdjacentHTML('beforeend', '<span class="badge badge-ok">Installed</span>');
+      if (missing) badges.insertAdjacentHTML('beforeend', '<span class="badge badge-danger">missing</span>');
+      else if (isBlocked)
+        badges.insertAdjacentHTML(
+          'beforeend',
+          '<span class="badge badge-warn" data-tip="The author disallows automated downloads, so resolve it after import">manual download</span>'
+        );
+      else badges.insertAdjacentHTML('beforeend', verdictBadge(item.verdict));
+      rows.push({ item, row, isBlocked, missing });
+      list.appendChild(row);
+    }
+
+    let overridesToggle = null;
+    if (isPack && preview.overrides && preview.overrides.count > 0) {
+      const box = document.createElement('label');
+      box.className = 'mt-3 flex items-start gap-2 rounded-md border border-line bg-raised p-2.5 text-xs';
+      box.innerHTML = `
+        <input type="checkbox" class="craftly-check mt-0.5 shrink-0">
+        <span class="text-ink-soft">Also apply the pack's <b>${Number(preview.overrides.count)} override file${preview.overrides.count === 1 ? '' : 's'}</b> (configs/scripts) to this server. Files that would be overwritten are backed up first inside the server folder.</span>`;
+      overridesToggle = box.querySelector('input');
+      content.appendChild(box);
+    }
+
+    const modal = openModal({
+      title: isMrpack ? 'Import Modrinth Modpack' : isPack ? 'Import CurseForge Modpack' : 'Import Mods from Zip',
+      content,
+      size: 'lg',
+      actions: [
+        { label: 'Cancel', kind: 'ghost' },
+        {
+          label: 'Install Selected',
+          kind: 'primary',
+          onClick: async () => {
+            const selections = rows
+              .filter((r) => !r.isBlocked && !r.missing && r.row.querySelector('input').checked)
+              .map((r) => (isPack ? r.item.fileId : r.item.entry));
+            if (!selections.length && !(overridesToggle && overridesToggle.checked)) {
+              toast('Nothing selected.', { kind: 'info' });
+              return false;
+            }
+            modal.close();
+            let report;
+            try {
+              report = await runTask({
+                title: 'Importing mod zip…',
+                start: async () => {
+                  const res = await post(`/api/servers/${serverId}/mods/import-zip`, {
+                    uploadToken,
+                    selections,
+                    applyOverrides: Boolean(overridesToggle && overridesToggle.checked),
+                  });
+                  if (!res) throw Object.assign(new Error('Import failed to start'), { dismissed: true });
+                  return res.taskId;
+                },
+              });
+            } catch (err) {
+              if (!err.dismissed) toast(err.message, { kind: 'error', timeout: 9000 });
+              return;
+            }
+            showZipImportReport({
+              serverId,
+              report,
+              blockedFallback: blocked,
+              onDone: () => setTimeout(() => location.reload(), 400),
+            });
+          },
+        },
+      ],
+    });
+  }
+
+  // ---- Mod search: Modrinth + CurseForge (reused by the manual-download resolver) ----
+  // allowDatapacks shows a Mods/Datapacks toggle (off for the resolver, which is
+  // hunting a mod replacement for a pack entry, never a datapack). Datapacks are
+  // Modrinth-only, so choosing that tab hides the platform chips.
+  function openModSearch({ prefill = '', onInstalled = null, allowDatapacks = false } = {}) {
+    const content = document.createElement('div');
+    content.innerHTML = `
+      <div class="flex flex-wrap items-center gap-2">
+        <input class="input min-w-48 flex-1" id="mr-q" placeholder="Search ${contentKind}s…" autocomplete="off">
+        ${(() => {
+          // Plugin servers get the two plugin-only registries too (Hangar is
+          // PaperMC's own, Spiget fronts SpigotMC) - both keyless.
+          const chips = [['modrinth', 'Modrinth']];
+          if (cfEnabled) chips.push(['curseforge', 'CurseForge']);
+          if (contentKind === 'plugin') chips.push(['hangar', 'Hangar'], ['spiget', 'SpigotMC']);
+          if (chips.length === 1) return '';
+          return `<div class="seg" id="mr-platforms" role="group" aria-label="Search platform">
+                 ${chips
+                   .map(
+                     ([value, label], i) =>
+                       `<button type="button" class="seg-btn" aria-pressed="${i === 0}" data-platform="${value}">${label}</button>`
+                   )
+                   .join('')}
+               </div>`;
+        })()}
+      </div>
+      ${
+        allowDatapacks
+          ? `<div class="seg mt-2" id="mr-kind" role="tablist" aria-label="Content type">
+               <button type="button" class="seg-btn" role="tab" aria-selected="true" data-search-kind="content">${contentKind === 'plugin' ? 'Plugins' : 'Mods'}</button>
+               <button type="button" class="seg-btn" role="tab" aria-selected="false" data-search-kind="datapack">Datapacks</button>
+             </div>`
+          : ''
+      }
+      ${
+        mc && !mc.startsWith('LATEST')
+          ? `<label class="mt-2 flex cursor-pointer items-start gap-2 text-sm">
+               <input type="checkbox" class="craftly-check mt-0.5" id="mr-any-version">
+               <span>Also show builds not listed as compatible with ${escAttr(mc)} or this server's loader. You accept the risk of installing one.</span>
+             </label>`
+          : ''
+      }
+      <div class="mt-3 max-h-96 space-y-2 overflow-y-auto" id="mr-results">
+        <p class="p-6 text-center text-sm text-ink-faint">Type to search.</p>
+      </div>`;
+    const modal = openModal({
+      title: contentKind === 'plugin' ? 'Search Plugins' : 'Search Mods',
+      content,
+      size: 'lg',
+    });
+    const q = content.querySelector('#mr-q');
+    const results = content.querySelector('#mr-results');
+    let platform = 'modrinth';
+    const platformsEl = content.querySelector('#mr-platforms');
+    platformsEl?.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-platform]');
+      if (!btn || btn.dataset.platform === platform) return;
+      platform = btn.dataset.platform;
+      content.querySelectorAll('#mr-platforms [data-platform]').forEach((b) => {
+        b.setAttribute('aria-pressed', String(b.dataset.platform === platform));
+      });
+      runSearch();
+    });
+
+    // Datapacks are Modrinth-only, so choosing that tab pins the platform to
+    // Modrinth and hides the chips. anyVersion waives the loader/MC filter.
+    let searchKind = 'content';
+    const anyVersion = content.querySelector('#mr-any-version');
+    content.querySelector('#mr-kind')?.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-search-kind]');
+      if (!btn || btn.getAttribute('aria-selected') === 'true') return;
+      content
+        .querySelectorAll('#mr-kind [data-search-kind]')
+        .forEach((b) => b.setAttribute('aria-selected', String(b === btn)));
+      searchKind = btn.dataset.searchKind;
+      if (searchKind === 'datapack') {
+        platform = 'modrinth';
+        platformsEl?.classList.add('hidden');
+      } else {
+        platformsEl?.classList.remove('hidden');
+      }
+      runSearch();
+    });
+    anyVersion?.addEventListener('change', runSearch);
+
+    // Already-installed hits get a badge instead of an Install button. Keyed by
+    // platform:projectId — only content installed through a platform can match.
+    let installedKeys = new Set();
+    fetch(`/api/servers/${serverId}/mods`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.ok) {
+          installedKeys = new Set(
+            (data.mods || []).filter((m) => m.platform && m.projectId).map((m) => `${m.platform}:${m.projectId}`)
+          );
+        }
+      })
+      .catch(() => {});
+
+    let timer;
+    q.addEventListener('input', () => {
+      clearTimeout(timer);
+      timer = setTimeout(runSearch, 350);
+    });
+    // Declared before the prefill search below — runSearch reads it synchronously.
+    const loader =
+      serverLoader || { FABRIC: 'fabric', QUILT: 'quilt', FORGE: 'forge', NEOFORGE: 'neoforge' }[serverType] || '';
+
+    q.value = prefill;
+    q.focus();
+    if (prefill) runSearch();
+
+    let searchSeq = 0; // a slow earlier response must not overwrite a newer one
+    async function runSearch() {
+      const query = q.value.trim();
+      if (!query) return;
+      const seq = ++searchSeq;
+      results.innerHTML = '<p class="p-6 text-center text-sm text-ink-faint">Searching…</p>';
+      const ignoreVersion = Boolean(anyVersion?.checked);
+      const kind = searchKind === 'datapack' ? 'datapack' : contentKind;
+      const params = new URLSearchParams({ q: query, kind, platform });
+      // The override waives the loader/MC filter; datapacks carry no loader facet.
+      if (loader && !ignoreVersion && searchKind !== 'datapack') params.set('loader', loader);
+      if (mc && !mc.startsWith('LATEST') && !ignoreVersion) params.set('mc', mc);
+      let data;
+      try {
+        const res = await fetch(`/api/mods/search?${params}`);
+        data = await res.json();
+      } catch {
+        // a network error used to strand "Searching…" on screen forever
+        data = { ok: false, error: 'Search failed. Check the connection and try again.' };
+      }
+      if (seq !== searchSeq) return;
+      if (!data.ok) {
+        const p = document.createElement('p');
+        p.className = 'p-6 text-center text-sm text-danger';
+        p.textContent = data.error || 'Search failed'; // upstream text — never innerHTML
+        results.replaceChildren(p);
+        return;
+      }
+      if (!data.results.length) {
+        results.innerHTML = '<p class="p-6 text-center text-sm text-ink-faint">No matches for this loader/version.</p>';
+        return;
+      }
+      results.innerHTML = '';
+      for (const hit of data.results) results.appendChild(resultRow(hit));
+    }
+
+    function resultRow(hit) {
+      const row = document.createElement('div');
+      row.className = 'rounded-md border border-line bg-raised p-2.5';
+      const installed = installedKeys.has(`${hit.platform}:${hit.projectId}`);
+      row.innerHTML = `
+        <div class="flex items-center gap-3">
+          ${hit.iconUrl ? `<img src="${escAttr(hit.iconUrl)}" alt="" class="size-10 shrink-0 rounded bg-inset object-cover">` : '<span class="grid size-10 shrink-0 place-items-center rounded bg-inset text-ink-faint">?</span>'}
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-sm font-semibold"></div>
+            <div class="truncate text-xs text-ink-faint" data-role="desc"></div>
+          </div>
+          <span class="shrink-0 text-xs text-ink-faint">${Number(hit.downloads).toLocaleString()} DLs</span>
+          ${installed ? '<span class="badge badge-ok shrink-0">Installed</span>' : '<button class="btn btn-primary btn-sm shrink-0" data-role="install">Install</button>'}
+        </div>
+        <div class="mt-2 hidden" data-role="fallback"></div>`;
+      row.querySelector('.font-semibold').textContent = hit.name;
+      row.querySelector('[data-role="desc"]').textContent = hit.description;
+      row.querySelector('[data-role="install"]')?.addEventListener('click', async (ev) => {
+        const btn = ev.currentTarget; // capture before await — currentTarget is null afterwards
+        if (hit.platform === 'curseforge') return installCurseforge(hit, row, btn);
+        // Spiget knows up front when a resource is hosted off SpigotMC - the
+        // proxy can't serve those, so go straight to the manual path.
+        if (hit.platform === 'spiget' && hit.external) return showExternalFallback(hit, row);
+        const isDatapack = searchKind === 'datapack';
+        const url =
+          hit.platform === 'hangar'
+            ? `https://hangar.papermc.io/p/${encodeURIComponent(hit.ref)}` // owner segment is decorative
+            : hit.platform === 'spiget'
+              ? `https://www.spigotmc.org/resources/${encodeURIComponent(hit.ref)}`
+              : `https://modrinth.com/${isDatapack ? 'datapack' : 'mod'}/${hit.ref}`;
+        const res2 = await withBusy(btn, 'Installing…', () =>
+          post(`/api/servers/${serverId}/mods`, {
+            url,
+            ...(isDatapack ? { kind: 'datapack' } : {}),
+            ignoreVersion: Boolean(anyVersion?.checked),
+          })
+        );
+        if (res2) done(res2);
+      });
+      return row;
+    }
+
+    // SpigotMC resources hosted off-site: same browser-download + upload path
+    // as CurseForge's distribution-denied mods.
+    function showExternalFallback(hit, row) {
+      const box = row.querySelector('[data-role="fallback"]');
+      box.classList.remove('hidden');
+      box.innerHTML = `
+        <div class="notice notice-warn flex-wrap items-center gap-2 text-xs">
+          <span class="text-warn">This resource is hosted outside SpigotMC, so download it in a browser, then upload the jar here.</span>
+          <a class="btn btn-sm" target="_blank" rel="noopener" href="https://www.spigotmc.org/resources/${encodeURIComponent(hit.ref)}">Open SpigotMC</a>
+          <button class="btn btn-sm" data-role="upload">Upload Jar</button>
+          <input type="file" accept=".jar,.zip" class="hidden" data-role="file">
+        </div>`;
+      wireFallbackUpload(box);
+    }
+
+    // CurseForge installs pre-check the chosen build: authors can forbid API
+    // downloads (downloadUrl null), and failing at install time with a raw 409
+    // is a dead end — offer the browser-download + manual-upload path instead.
+    async function installCurseforge(hit, row, btn) {
+      const params = new URLSearchParams({ platform: 'curseforge', ref: hit.ref, kind: contentKind });
+      if (loader) params.set('loader', loader);
+      if (mc && !mc.startsWith('LATEST')) params.set('mc', mc);
+      const restore = setBusy(btn, 'Installing…');
+      let versions;
+      try {
+        const data = await fetch(`/api/mods/versions?${params}`).then((r) => r.json());
+        if (!data.ok) throw new Error(data.error || 'Version lookup failed');
+        versions = data.versions || [];
+      } catch (err) {
+        restore();
+        toast(err.message, { kind: 'error' });
+        return;
+      }
+      if (!versions.length) {
+        restore();
+        toast(`No ${hit.name} build matches this server's loader/MC version.`, { kind: 'error' });
+        return;
+      }
+      const build = versions[0];
+      if (build.downloadable === false) {
+        restore();
+        showManualFallback(hit, row, build);
+        return;
+      }
+      // Pin the exact build we just checked so what installs is what was vetted.
+      const url = `https://www.curseforge.com/minecraft/${cfSection}/${hit.ref}/files/${build.versionId}`;
+      const res2 = await post(`/api/servers/${serverId}/mods`, { url });
+      restore();
+      if (res2) done(res2);
+    }
+
+    function showManualFallback(hit, row, build) {
+      const box = row.querySelector('[data-role="fallback"]');
+      box.classList.remove('hidden');
+      box.innerHTML = `
+        <div class="notice notice-warn flex-wrap items-center gap-2 text-xs">
+          <span class="text-warn">The author disallows automated downloads, so grab <b data-role="build"></b> in a browser, then upload the jar here.</span>
+          <a class="btn btn-sm" target="_blank" rel="noopener" href="https://www.curseforge.com/minecraft/${cfSection}/${encodeURIComponent(hit.ref)}/files">Open CurseForge</a>
+          <button class="btn btn-sm" data-role="upload">Upload Jar</button>
+          <input type="file" accept=".jar,.zip" class="hidden" data-role="file">
+        </div>`;
+      box.querySelector('[data-role="build"]').textContent = build.name || build.versionNumber || 'the file';
+      wireFallbackUpload(box);
+    }
+
+    /** Shared upload wiring for the manual-download fallback boxes. */
+    function wireFallbackUpload(box) {
+      const fileInput = box.querySelector('[data-role="file"]');
+      box.querySelector('[data-role="upload"]').addEventListener('click', () => fileInput.click());
+      fileInput.addEventListener('change', async () => {
+        if (!fileInput.files.length) return;
+        const fd = new FormData();
+        fd.append('file', fileInput.files[0]);
+        const restore = setBusy(box.querySelector('[data-role="upload"]'));
+        try {
+          const res = await fetch(`/api/servers/${serverId}/mods/upload`, { method: 'POST', body: fd });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data.ok) throw new Error(data.error || 'Upload failed');
+          toast(`Uploaded ${fileInput.files[0].name}.`);
+          done(data);
+        } catch (err) {
+          toast(err.message, { kind: 'error' });
+        } finally {
+          restore();
+        }
+      });
+    }
+
+    function done(res) {
+      if (res.installed && res.installed.name) {
+        const note = overrideNote(res.installed);
+        toast(
+          `Installed ${res.installed.name}.${note ? ` ${note}` : ''}`,
+          note ? { kind: 'warn', timeout: 9000 } : undefined
+        );
+      }
+      modal.close();
+      if (onInstalled) onInstalled(res);
+      else setTimeout(() => location.reload(), 700);
+    }
+  }
+  document.getElementById('mods-search')?.addEventListener('click', () => openModSearch({ allowDatapacks: true }));
+
+  // ---- Update all: apply every non-ignored overlay update, then one restart ----
+  document.getElementById('mods-update-all')?.addEventListener('click', async () => {
+    const pending = document.querySelectorAll('#mods-table [data-mod-update]').length;
+    const ok = await confirmDialog({
+      title: 'Update all mods?',
+      message: `Applies ${pending} available update${pending === 1 ? '' : 's'}, then restarts the server once if it is running. Ignored updates are skipped.`,
+      confirmLabel: 'Update All',
+    });
+    if (!ok) return;
+    let result;
+    try {
+      result = await runTask({
+        title: 'Updating mods…',
+        start: async () => {
+          const res = await post(`/api/servers/${serverId}/mods/update-all`, {});
+          if (!res) throw Object.assign(new Error('Update failed to start'), { dismissed: true });
+          return res.taskId;
+        },
+      });
+    } catch (err) {
+      if (!err.dismissed) toast(err.message, { kind: 'error', timeout: 9000 });
+      return;
+    }
+    const updated = (result && result.updated) || [];
+    const failed = (result && result.failed) || [];
+    toast(
+      `Updated ${updated.length} mod${updated.length === 1 ? '' : 's'}` +
+        (failed.length ? `, ${failed.length} failed` : '') +
+        (result && result.restarted ? ', server restarting.' : '.'),
+      { kind: failed.length ? 'warn' : 'success', timeout: failed.length ? 9000 : 5000 }
+    );
+    setTimeout(() => location.reload(), 900);
+  });
+
+  // ---- Manual-download resolver: MODS_NEED_DOWNLOAD.txt → guided actions ----
+  const pendingBox = document.getElementById('mods-pending');
+  let pendingAutoOpened = false;
+
+  async function refreshPending(autoOpen = false) {
+    if (!pendingBox) return;
+    let list = [];
+    try {
+      const data = await fetch(`/api/servers/${serverId}/pending-downloads`).then((r) => r.json());
+      list = (data.ok && data.mods) || [];
+    } catch {
+      return;
+    }
+    if (!list.length) {
+      pendingBox.classList.add('hidden');
+      pendingBox.innerHTML = '';
+      return;
+    }
+    pendingBox.classList.remove('hidden');
+    pendingBox.innerHTML = `
+      <div class="notice notice-warn flex-wrap gap-3">
+        <span class="text-warn">${list.length} ${list.length === 1 ? 'mod' : 'mods'} in this modpack couldn't be auto-downloaded, so the pack won't finish installing until each is resolved.</span>
+        <button class="btn btn-sm ml-auto" id="mods-pending-open">Resolve Now</button>
+      </div>`;
+    pendingBox.querySelector('#mods-pending-open').addEventListener('click', () => openPendingModal(list));
+    if (autoOpen && !pendingAutoOpened) {
+      pendingAutoOpened = true;
+      openPendingModal(list);
+    }
+  }
+
+  function openPendingModal(list) {
+    const content = document.createElement('div');
+    content.innerHTML = `
+      <p class="mb-3 text-sm text-ink-soft">These mods disallow automated download (or were pulled from CurseForge), so the pack can't finish. For each one, <b>Exclude</b> it, install a replacement via <b>search</b>, or <b>upload</b> the jar you downloaded by hand. Changes apply on the next recreate.</p>
+      <div class="space-y-2" id="pending-list"></div>`;
+    openModal({ title: 'Mods That Need Manual Action', content, size: 'lg' });
+    const listEl = content.querySelector('#pending-list');
+
+    function render(mods) {
+      if (!mods.length) {
+        listEl.innerHTML =
+          '<div class="notice notice-ok"><svg class="icon size-4 mt-0.5 shrink-0 text-ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg><div>All resolved. Recreate the server to apply.</div></div>';
+        return;
+      }
+      listEl.innerHTML = '';
+      for (const m of mods) {
+        const term =
+          m.filename
+            .replace(/\.(jar|zip)$/i, '')
+            .split(/[-_]\d/)[0]
+            .replace(/[-_]+/g, ' ')
+            .trim() ||
+          m.name ||
+          m.filename;
+        const row = document.createElement('div');
+        row.className = 'rounded-md border border-line bg-raised p-3';
+        row.innerHTML = `
+          <div class="mb-2 min-w-0">
+            <div class="truncate text-sm font-semibold"></div>
+            <div class="truncate font-mono text-xs text-ink-faint"></div>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button class="btn btn-sm" data-act="exclude">Exclude from Pack</button>
+            <button class="btn btn-sm" data-act="search">Find Replacement</button>
+            <button class="btn btn-sm" data-act="upload">Upload Jar</button>
+            <a class="btn btn-sm" target="_blank" rel="noopener" data-act="open">Open CF page</a>
+          </div>
+          <input type="file" accept=".jar,.zip" class="hidden" data-role="file">`;
+        row.querySelector('.font-semibold').textContent = m.name || m.filename;
+        row.querySelector('.font-mono').textContent = m.filename;
+        // Pack-manifest URL is third-party data — allow only http(s).
+        const cfLink = row.querySelector('[data-act="open"]');
+        if (/^https?:\/\//i.test(m.url || '')) cfLink.href = m.url;
+        else cfLink.remove();
+        const fileInput = row.querySelector('[data-role="file"]');
+
+        row.querySelector('[data-act="exclude"]').addEventListener('click', async (ev) => {
+          const res = await withBusy(ev.currentTarget, 'Excluding…', () =>
+            post(`/api/servers/${serverId}/pending-downloads/exclude`, { filename: m.filename })
+          );
+          if (res) {
+            toast(`Excluded ${m.name || m.filename}.`);
+            render(res.mods || []);
+            refreshPending();
+          }
+        });
+
+        row.querySelector('[data-act="search"]').addEventListener('click', () => {
+          openModSearch({
+            prefill: term,
+            onInstalled: async () => {
+              await post(`/api/servers/${serverId}/pending-downloads/exclude`, { filename: m.filename });
+              const data = await fetch(`/api/servers/${serverId}/pending-downloads`)
+                .then((r) => r.json())
+                .catch(() => ({}));
+              render((data && data.mods) || []);
+              refreshPending();
+            },
+          });
+        });
+
+        row.querySelector('[data-act="upload"]').addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', async () => {
+          if (!fileInput.files.length) return;
+          const fd = new FormData();
+          fd.append('file', fileInput.files[0]);
+          fd.append('excludeFilename', m.filename);
+          const restore = setBusy(row.querySelector('[data-act="upload"]'));
+          try {
+            const res = await fetch(`/api/servers/${serverId}/mods/upload`, { method: 'POST', body: fd });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.ok) throw new Error(data.error || 'Upload failed');
+            toast(`Uploaded ${fileInput.files[0].name}.`);
+            render(data.mods || []);
+            refreshPending();
+          } catch (err) {
+            toast(err.message, { kind: 'error' });
+          } finally {
+            restore();
+          }
+        });
+
+        listEl.appendChild(row);
+      }
+    }
+    render(list);
+  }
+
+  refreshPending(true);
+
+  async function post(url, body) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        toast(data.error || 'That request could not be completed. Please try again in a moment.', {
+          kind: 'error',
+          timeout: 9000,
+        });
+        return null;
+      }
+      return data;
+    } catch {
+      toast('The panel could not be reached. Check your connection and try again.', { kind: 'error' });
+      return null;
+    }
+  }
+}

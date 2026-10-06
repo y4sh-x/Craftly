@@ -1,0 +1,35 @@
+{{> page-header heading="ALLOCATIONS" sub="Real node IP/port assignments used for server placement."}}
+<div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+  <p class="help">Allocations are persistent and unique per node. Assigned ports cannot be deleted until released.</p>
+  <button class="btn" id="allocation-refresh">Refresh</button>
+</div>
+<div id="allocation-notice" class="notice notice-warn mb-5 hidden"></div>
+<div class="grid gap-4 lg:grid-cols-2" id="allocation-list">
+{{#each allocations}}
+  <article class="card" data-allocation="{{id}}">
+    <div class="flex items-start justify-between gap-3">
+      <div><h2 class="font-semibold">{{ip}}:{{port}}</h2><p class="help mt-1">{{node_name}} · {{protocol}}</p></div>
+      <span class="badge">{{#if assigned}}Assigned{{else}}Available{{/if}}</span>
+    </div>
+    {{#if alias}}<p class="mt-3 text-sm">{{alias}}</p>{{/if}}
+    {{#if assigned}}<p class="mt-2 text-sm text-ink-soft">Server: {{server_name}}</p>{{/if}}
+    <div class="mt-4 flex gap-2">
+      {{#if assigned}}<button class="btn btn-ghost" data-release="{{id}}">Release</button>{{else}}<button class="btn btn-ghost" data-delete="{{id}}">Delete</button>{{/if}}
+    </div>
+  </article>
+{{else}}
+  <div class="card"><p class="help">No allocations registered.</p></div>
+{{/each}}
+</div>
+<section class="card mt-6">
+  <h2 class="font-semibold">Create allocation</h2>
+  <form id="allocation-create" class="mt-5 grid gap-4 sm:grid-cols-2">
+    <input class="input" name="nodeId" required placeholder="Node ID (e.g. local)">
+    <input class="input" name="ip" value="0.0.0.0" required placeholder="IP / bind address">
+    <input class="input" name="port" type="number" min="1" max="65535" required placeholder="Port">
+    <select class="input" name="protocol"><option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP + UDP</option></select>
+    <input class="input sm:col-span-2" name="alias" maxlength="100" placeholder="Alias (optional)">
+    <button class="btn sm:col-span-2" type="submit">Create allocation</button>
+  </form>
+</section>
+<script type="module" src="/js/pages/allocations.js"></script>

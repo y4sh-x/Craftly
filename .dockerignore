@@ -1,0 +1,20 @@
+# Keep the build context to what the image build actually reads: package files,
+# src/, views/, public/, assets/, scripts/ (Tailwind scans these for classes).
+.git
+.github
+node_modules
+data
+docs
+public/dist
+test
+types
+.env
+*.log
+pnpm-debug.log*
+.eslintcache
+.prettiercache
+.vscode
+.idea
+Dockerfile
+docker-compose.yml
+.codegraph/

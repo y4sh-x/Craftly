@@ -1,0 +1,533 @@
+// Per-player page actions: whitelist / op / ban toggles, kick, and the full
+// teleport modal. Uses the same /api/servers/:id/players endpoints as the roster.
+import { toast } from '../lib/toast.js';
+import { friendlyError } from '../lib/errors.js';
+import { openModal } from '../lib/modal.js';
+import { confirmDialog } from '../lib/confirm.js';
+import { withBusy } from '../lib/loading.js';
+import { escapeHtml } from '../lib/format.js';
+
+const root = document.querySelector('[data-player-detail]');
+if (root) init(root);
+
+function init(root) {
+  const serverId = root.dataset.serverId;
+  const name = root.dataset.playerName;
+  const base = `/api/servers/${serverId}/players`;
+
+  async function api(path, body) {
+    const res = await fetch(base + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || friendlyError(res, { action: 'complete that action' }));
+    return data;
+  }
+  const fail = (err) => toast(err.message || 'Something went wrong. Please try again.', { kind: 'error' });
+  const prettyBiome = (id) => {
+    const b = String(id).replace(/^#/, '').split(':').pop().split('/').pop().replace(/_/g, ' ');
+    return b.charAt(0).toUpperCase() + b.slice(1);
+  };
+  const DIM_SHORT = {
+    'minecraft:overworld': 'Overworld',
+    'minecraft:the_nether': 'Nether',
+    'minecraft:the_end': 'End',
+  };
+  const dimShort = (d) =>
+    DIM_SHORT[d] ||
+    String(d || '')
+      .split(':')
+      .pop();
+  const dimLong = (d) =>
+    ({ 'minecraft:overworld': 'the Overworld', 'minecraft:the_nether': 'the Nether', 'minecraft:the_end': 'the End' })[
+      d
+    ] || dimShort(d);
+  const DIM_ORDER = { 'minecraft:overworld': 0, 'minecraft:the_nether': 1, 'minecraft:the_end': 2 };
+  // Sort by dimension then friendly name; label as "Nether · Crimson Forest".
+  const sortByDim = (list) =>
+    [...list].sort(
+      (a, b) =>
+        (DIM_ORDER[a.dimension] ?? 9) - (DIM_ORDER[b.dimension] ?? 9) ||
+        prettyBiome(a.id).localeCompare(prettyBiome(b.id))
+    );
+
+  // ---- in-place chip/banner patching (mirrors the roster page - same
+  // action, same UI, no page flash and no silent success) ----
+  const CHIP_ON = {
+    whitelist: ['border-grass-700', 'bg-grass-500/15', 'text-ok'],
+    op: ['border-diamond-700', 'bg-diamond-400/15', 'text-link'],
+    ban: ['border-danger/40', 'bg-redstone-500/15', 'text-danger'],
+  };
+  function setChip(role, on, label) {
+    const chip = root.querySelector(`[data-role-toggle="${role}"]`);
+    if (!chip) return;
+    chip.dataset.on = on ? '1' : '0';
+    chip.classList.remove(...Object.values(CHIP_ON).flat());
+    if (on) chip.classList.add(...CHIP_ON[role]);
+    if (label) chip.querySelector('[data-chip-label]').textContent = label;
+    const tips = {
+      whitelist: on ? 'Remove from whitelist' : 'Add to whitelist',
+      op: on ? 'Remove operator status' : 'Make operator (level 4)',
+      ban: on ? 'Pardon this player' : 'Ban this player',
+    };
+    chip.dataset.tip = tips[role];
+  }
+  function setBanBanner(reason, expires) {
+    root.querySelector('[data-ban-banner]')?.remove();
+    if (reason === false) return;
+    const banner = document.createElement('div');
+    banner.dataset.banBanner = '';
+    banner.className = 'notice notice-danger mt-3 text-xs';
+    const text = document.createElement('div');
+    text.innerHTML = '<b class="text-danger">Banned:</b> ';
+    text.append(`${reason || 'No reason recorded'}${expires ? ` · expires ${expires}` : ''}.`);
+    banner.innerHTML =
+      '<svg class="icon size-4 mt-0.5 shrink-0 text-danger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></svg>';
+    banner.appendChild(text);
+    root.querySelector('.card')?.appendChild(banner);
+  }
+  function setOffline() {
+    const status = root.querySelector('[data-player-status]');
+    if (status)
+      status.innerHTML =
+        '<span class="flex items-center gap-1.5 text-xs font-medium text-ink-faint"><span class="status-dot bg-stone-500"></span> Offline</span>';
+    root.querySelector('[data-act="kick"]')?.remove();
+  }
+
+  // ---- role chips (whitelist / op / ban) ----
+  root.addEventListener('click', async (e) => {
+    const chip = e.target.closest('[data-role-toggle]');
+    if (chip) {
+      const kind = chip.dataset.roleToggle;
+      const on = chip.dataset.on === '1';
+      try {
+        if (kind === 'whitelist') {
+          await withBusy(chip, () => api('/whitelist', { name, on: !on }));
+          setChip('whitelist', !on);
+          toast(`${name} ${on ? 'removed from the whitelist' : 'added to the whitelist'}.`);
+        } else if (kind === 'op') {
+          const { result } = await withBusy(chip, () => api('/op', { name, on: !on }));
+          if (result.note) toast(result.note, { kind: 'info', timeout: 8000 });
+          setChip('op', !on, !on && result.opLevel ? `Op L${result.opLevel}` : 'Op');
+          toast(`${name} ${on ? 'is no longer an operator' : 'is now an operator'}.`);
+        } else if (kind === 'ban') {
+          if (on) {
+            const ok = await confirmDialog({
+              title: `Pardon ${name}?`,
+              message: 'The player will be able to join again.',
+              confirmLabel: 'Pardon',
+            });
+            if (!ok) return;
+            await withBusy(chip, () => api('/pardon', { name }));
+            setChip('ban', false, 'Ban');
+            setBanBanner(false);
+            toast(`${name} pardoned.`);
+          } else {
+            banModal();
+          }
+        }
+      } catch (err) {
+        fail(err);
+      }
+      return;
+    }
+    const act = e.target.closest('[data-act]');
+    if (!act) return;
+    if (act.dataset.act === 'kick') kickModal();
+    else if (act.dataset.act === 'teleport') teleportModal();
+    else if (act.dataset.act === 'delete-player') {
+      const ok = await confirmDialog({
+        title: `Delete ${name}?`,
+        message:
+          'This removes the player from the whitelist, operators, bans, and usercache; deletes their saved inventory, stats and advancements; and clears their moderators notes. This cannot be undone.',
+        confirmLabel: 'Delete',
+        danger: true,
+      });
+      if (!ok) return;
+      try {
+        await withBusy(act, async () => {
+          const res = await fetch(`${base}/${encodeURIComponent(name)}`, { method: 'DELETE' });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data.ok === false)
+            throw new Error(data.error || friendlyError(res, { action: 'delete that player' }));
+        });
+        location.href = `/servers/${serverId}/players`;
+      } catch (err) {
+        fail(err);
+      }
+    }
+    // copy-uuid is handled by the global [data-copy] handler in app.js
+  });
+
+  // ---- ban (same labeled dialog as the roster page - one action, one UI) ----
+  function banModal() {
+    const content = document.createElement('div');
+    content.className = 'space-y-3';
+    content.innerHTML = `
+      <div>
+        <label class="label">Ban reason (recorded in the ban list)</label>
+        <input class="input" data-f="reason" placeholder="Banned by an operator" maxlength="256">
+      </div>
+      <div>
+        <label class="label">Duration</label>
+        <select class="input" data-f="duration" data-label="Ban duration">
+          <option value="">Permanent</option>
+          <option value="3600000">1 hour</option>
+          <option value="86400000">1 day</option>
+          <option value="259200000">3 days</option>
+          <option value="604800000">7 days</option>
+          <option value="2592000000">30 days</option>
+        </select>
+        <p class="mt-2 text-xs text-ink-faint">A temporary ban lifts automatically when it expires, so there's no need to remember to pardon them.</p>
+      </div>`;
+    openModal({
+      title: `Ban ${name}`,
+      content,
+      size: 'sm',
+      actions: [
+        { label: 'Cancel', kind: 'ghost' },
+        {
+          label: 'Ban Player',
+          kind: 'danger',
+          busyLabel: 'Banning…',
+          onClick: async ({ body }) => {
+            const reason = body.querySelector('[data-f="reason"]').value.trim();
+            const duration = body.querySelector('[data-f="duration"]').value;
+            try {
+              const { result } = await api('/ban', {
+                name,
+                reason: reason || undefined,
+                durationMs: duration ? Number(duration) : undefined,
+              });
+              setChip('ban', true, 'Banned');
+              setBanBanner(reason, result.banExpires);
+              toast(`${name} banned${result.banExpires ? ` until ${result.banExpires}` : ''}.`);
+            } catch (err) {
+              fail(err);
+              return false;
+            }
+          },
+        },
+      ],
+    });
+  }
+
+  // ---- moderator notes ----
+  const notesList = root.querySelector('[data-notes-list]');
+  const notesEmpty = root.querySelector('[data-notes-empty]');
+  const notesAddBtn = root.querySelector('[data-notes-add]');
+
+  function renderNotes(notes) {
+    if (!notesList) return;
+    notesList.innerHTML = '';
+    if (notesEmpty) notesEmpty.classList.toggle('hidden', notes.length > 0);
+    for (const n of notes) {
+      const row = document.createElement('div');
+      row.className = 'flex items-start justify-between gap-2 rounded-md bg-inset p-2 text-sm';
+      row.dataset.noteId = n.id;
+      const text = document.createElement('div');
+      text.className = 'min-w-0';
+      const p = document.createElement('p');
+      p.className = 'whitespace-pre-wrap break-words';
+      p.textContent = n.note;
+      const meta = document.createElement('p');
+      meta.className = 'mt-1 text-xs text-ink-faint';
+      meta.textContent = `${n.author} · ${n.createdAt}`;
+      text.append(p, meta);
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'btn btn-ghost btn-sm text-danger shrink-0';
+      del.setAttribute('aria-label', 'Delete note');
+      del.innerHTML =
+        '<svg class="icon size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
+      del.addEventListener('click', async () => {
+        try {
+          await withBusy(del, async () => {
+            const res = await fetch(`${base}/notes/${n.id}`, { method: 'DELETE' });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.ok) throw new Error(data.error || friendlyError(res, { action: 'delete that note' }));
+            row.remove();
+            if (notesList && !notesList.children.length && notesEmpty) notesEmpty.classList.remove('hidden');
+          });
+        } catch (err) {
+          fail(err);
+        }
+      });
+      row.append(text, del);
+      notesList.appendChild(row);
+    }
+  }
+
+  function loadNotes() {
+    fetch(`${base}/notes?name=${encodeURIComponent(name)}`)
+      .then((r) => r.json())
+      .then((d) => renderNotes(d.notes || []))
+      .catch(() => renderNotes([]));
+  }
+  if (notesList) loadNotes();
+
+  if (notesAddBtn)
+    notesAddBtn.addEventListener('click', () => {
+      const content = document.createElement('div');
+      content.innerHTML = `<label class="label">Note</label><textarea class="input" data-f="note" rows="3" maxlength="1000"></textarea>`;
+      openModal({
+        title: `Note for ${name}`,
+        content,
+        size: 'sm',
+        actions: [
+          { label: 'Cancel', kind: 'ghost' },
+          {
+            label: 'Add Note',
+            kind: 'primary',
+            busyLabel: 'Adding…',
+            onClick: async ({ body }) => {
+              const note = body.querySelector('[data-f="note"]').value.trim();
+              if (!note) return false;
+              try {
+                await api('/notes', { name, note });
+                loadNotes();
+                toast('Note added.');
+              } catch (err) {
+                fail(err);
+                return false;
+              }
+            },
+          },
+        ],
+      });
+    });
+
+  // ---- kick ----
+  function kickModal() {
+    const content = document.createElement('div');
+    content.className = 'space-y-3 text-sm';
+    content.innerHTML = `<div><label class="label">Kick message (optional)</label><input class="input" data-f="message" maxlength="120" placeholder="Kicked by an operator"></div>`;
+    openModal({
+      title: `Kick ${name}`,
+      content,
+      size: 'sm',
+      actions: [
+        { label: 'Cancel', kind: 'ghost' },
+        {
+          label: 'Kick',
+          kind: 'danger',
+          busyLabel: 'Kicking…',
+          onClick: async ({ body }) => {
+            try {
+              await api('/kick', { name, message: body.querySelector('[data-f="message"]').value.trim() || undefined });
+              setOffline(); // no stale pulsing "Online" + re-clickable Kick
+              toast(`${name} kicked.`);
+            } catch (err) {
+              fail(err);
+              return false;
+            }
+          },
+        },
+      ],
+    });
+  }
+
+  // ---- teleport (coords / biome / to-player / random / structure) ----
+  let biomesP = null,
+    structuresP = null,
+    rosterP = null;
+  const loadBiomes = () =>
+    (biomesP ||= fetch(`/api/servers/${serverId}/players/biomes`)
+      .then((r) => r.json())
+      .then((d) => d.biomes || [])
+      .catch(() => []));
+  const loadStructures = () =>
+    (structuresP ||= fetch(`/api/servers/${serverId}/players/structures`)
+      .then((r) => r.json())
+      .then((d) => d.structures || [])
+      .catch(() => []));
+  const loadRoster = () =>
+    (rosterP ||= fetch(`/api/servers/${serverId}/players`)
+      .then((r) => r.json())
+      .then((d) => d.players || [])
+      .catch(() => []));
+
+  function teleportModal() {
+    const content = document.createElement('div');
+    content.className = 'space-y-4 text-sm';
+    content.innerHTML = `
+      <div class="seg w-full" role="tablist">
+        <button type="button" class="seg-btn flex-1 justify-center" role="tab" aria-selected="false" data-tp-mode="coords">Coordinates</button>
+        <button type="button" class="seg-btn flex-1 justify-center" role="tab" aria-selected="false" data-tp-mode="biome">Biome</button>
+        <button type="button" class="seg-btn flex-1 justify-center" role="tab" aria-selected="false" data-tp-mode="player">To player</button>
+        <button type="button" class="seg-btn flex-1 justify-center" role="tab" aria-selected="false" data-tp-mode="rtp">Random</button>
+        <button type="button" class="seg-btn flex-1 justify-center" role="tab" aria-selected="false" data-tp-mode="structure">Structure</button>
+      </div>
+      <div data-tp-panel="coords" class="space-y-3">
+        <div class="grid grid-cols-3 gap-2">
+          <div><label class="label">X</label><input class="input" type="number" data-f="x" placeholder="0"></div>
+          <div><label class="label">Y</label><input class="input" type="number" data-f="y" placeholder="surface"></div>
+          <div><label class="label">Z</label><input class="input" type="number" data-f="z" placeholder="0"></div>
+        </div>
+        <div><label class="label">Dimension</label>
+          <select class="input" data-f="dimension" data-label="Dimension">
+            <option value="">Current dimension</option>
+            <option value="minecraft:overworld">Overworld</option>
+            <option value="minecraft:the_nether">The Nether</option>
+            <option value="minecraft:the_end">The End</option>
+          </select></div>
+        <p class="text-xs text-ink-faint">Leave Y empty to land safely on the highest solid ground.</p>
+      </div>
+      <div data-tp-panel="biome" class="hidden space-y-3">
+        <label class="label">Biome</label>
+        <select class="input" data-f="biome" data-label="Biome"><option value="">Loading biomes…</option></select>
+      </div>
+      <div data-tp-panel="player" class="hidden space-y-3">
+        <label class="label">Target player (online)</label>
+        <select class="input" data-f="target" data-label="Target player"><option value="">Loading…</option></select>
+      </div>
+      <div data-tp-panel="rtp" class="hidden space-y-3">
+        <div class="grid grid-cols-2 gap-2">
+          <div><label class="label">Min distance</label><input class="input" type="number" data-f="minDistance" value="500" min="0"></div>
+          <div><label class="label">Max distance</label><input class="input" type="number" data-f="maxDistance" value="5000" min="16"></div>
+        </div>
+        <div><label class="label">Around</label>
+          <select class="input" data-f="center" data-label="Around">
+            <option value="player">The player's current position</option>
+            <option value="origin">World center (0, 0)</option>
+          </select></div>
+      </div>
+      <div data-tp-panel="structure" class="hidden space-y-3">
+        <label class="label">Structure</label>
+        <select class="input" data-f="structure" data-label="Structure"><option value="">Loading structures…</option></select>
+        <div class="grid grid-cols-2 items-end gap-2">
+          <div><label class="label">Search radius</label><input class="input" type="number" data-f="structMaxDistance" value="5000" min="16"></div>
+          <label class="flex items-center gap-2 pb-2"><input type="checkbox" class="craftly-check" data-f="structRandom" checked> Surprise me</label>
+        </div>
+      </div>`;
+
+    let mode = 'coords';
+    let inflight = false;
+    const tabs = content.querySelectorAll('[data-tp-mode]');
+    const setMode = (next) => {
+      mode = next;
+      tabs.forEach((t) => t.setAttribute('aria-selected', String(t.dataset.tpMode === mode)));
+      content
+        .querySelectorAll('[data-tp-panel]')
+        .forEach((p) => p.classList.toggle('hidden', p.dataset.tpPanel !== mode));
+      if (mode === 'biome') fillSelect(content.querySelector('[data-f="biome"]'), loadBiomes(), prettyBiome);
+      if (mode === 'structure')
+        fillSelect(content.querySelector('[data-f="structure"]'), loadStructures(), prettyBiome);
+      if (mode === 'player') fillTargets(content.querySelector('[data-f="target"]'));
+    };
+    tabs.forEach((t) => t.addEventListener('click', () => setMode(t.dataset.tpMode)));
+    setMode('coords');
+
+    function fillSelect(sel, promise, label) {
+      if (!sel || sel.dataset.loaded) return;
+      promise.then((items) => {
+        // items are {id, dimension}; label options as "Nether · Crimson Forest".
+        const list = sortByDim(items);
+        sel.innerHTML = list.length
+          ? list
+              .map(
+                (e) =>
+                  `<option value="${escapeHtml(e.id)}">${escapeHtml(dimShort(e.dimension))} · ${escapeHtml(label(e.id))}</option>`
+              )
+              .join('')
+          : '<option value="">None available. Start the server to load the list.</option>';
+        sel.dataset.loaded = '1';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+    }
+    function fillTargets(sel) {
+      if (!sel || sel.dataset.loaded) return;
+      loadRoster().then((list) => {
+        const online = list.filter((p) => p.online && p.name !== name);
+        sel.innerHTML = online.length
+          ? online.map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join('')
+          : '<option value="">No other players online</option>';
+        sel.dataset.loaded = '1';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+    }
+
+    openModal({
+      title: `Teleport ${name}`,
+      content,
+      actions: [
+        { label: 'Cancel', kind: 'ghost' },
+        {
+          label: 'Teleport',
+          kind: 'primary',
+          busyLabel: 'Searching…',
+          onClick: async ({ body }) => {
+            if (inflight) {
+              toast('The previous teleport is still searching. Please wait for it to finish.', { kind: 'error' });
+              return false;
+            }
+            const f = (k) => body.querySelector(`[data-f="${k}"]`).value;
+            let payload;
+            if (mode === 'coords') {
+              if ([f('x'), f('z')].some((v) => v.trim() === '')) {
+                toast('Enter X and Z. Y is optional; leave it empty to land on the surface.', { kind: 'error' });
+                return false;
+              }
+              payload = { mode, player: name, x: Number(f('x')), z: Number(f('z')) };
+              if (f('y').trim() !== '') payload.y = Number(f('y'));
+              if (f('dimension')) payload.dimension = f('dimension');
+            } else if (mode === 'biome') {
+              if (!f('biome')) {
+                toast('Pick a biome.', { kind: 'error' });
+                return false;
+              }
+              payload = { mode, player: name, biome: f('biome') };
+            } else if (mode === 'rtp') {
+              payload = {
+                mode,
+                player: name,
+                minDistance: Number(f('minDistance')) || 500,
+                maxDistance: Number(f('maxDistance')) || 5000,
+                center: f('center') || 'player',
+              };
+            } else if (mode === 'structure') {
+              if (!f('structure')) {
+                toast('Pick a structure.', { kind: 'error' });
+                return false;
+              }
+              payload = {
+                mode,
+                player: name,
+                structure: f('structure'),
+                random: body.querySelector('[data-f="structRandom"]').checked,
+                maxDistance: Number(f('structMaxDistance')) || 5000,
+              };
+            } else {
+              if (!f('target')) {
+                toast('No target player available.', { kind: 'error' });
+                return false;
+              }
+              payload = { mode, player: name, target: f('target') };
+            }
+            inflight = true;
+            try {
+              const { result } = await api('/teleport', payload);
+              const at = (r) => `${r.x}, ${r.z}${r.dimension ? ` in ${dimLong(r.dimension)}` : ''}`;
+              toast(
+                mode === 'biome'
+                  ? `${name} sent to ${prettyBiome(result.biome)} at ${at(result)}.`
+                  : mode === 'rtp'
+                    ? `${name} randomly teleported ${result.distance} blocks out to ${at(result)}.`
+                    : mode === 'structure'
+                      ? `${name} sent to a ${prettyBiome(result.structure)} at ${at(result)}.`
+                      : `${name} teleported.`
+              );
+            } catch (err) {
+              fail(err);
+              return false;
+            } finally {
+              inflight = false;
+            }
+          },
+        },
+      ],
+    });
+  }
+}

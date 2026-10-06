@@ -1,0 +1,41 @@
+{{> page-header heading="DATABASES" sub="Docker-backed MariaDB, MySQL and PostgreSQL database hosts."}}
+
+<div class="mb-5 help">Database hosts are real Docker containers managed by Craftly. Credentials are generated server-side and are never rendered in this page.</div>
+
+<section class="card mb-6">
+  <div class="flex items-center justify-between gap-3">
+    <div><h2 class="font-semibold">Database hosts</h2><p class="help mt-1">Provision and remove dedicated database hosts.</p></div>
+    <button class="btn" id="db-host-refresh">Refresh</button>
+  </div>
+  <div id="db-hosts" class="mt-5 grid gap-4 lg:grid-cols-2">
+    {{#each hosts}}
+      <article class="card" data-db-host-id="{{id}}">
+        <div class="flex items-center justify-between gap-3"><h3 class="font-semibold">{{name}}</h3><span class="badge">{{status}}</span></div>
+        <dl class="mt-4 grid grid-cols-2 gap-3 text-sm">
+          <div><dt class="text-xs text-ink-faint">Engine</dt><dd>{{engine}}</dd></div>
+          <div><dt class="text-xs text-ink-faint">Node</dt><dd>{{node_id}}</dd></div>
+          <div><dt class="text-xs text-ink-faint">Host</dt><dd class="font-mono">{{host}}:{{port}}</dd></div>
+          <div><dt class="text-xs text-ink-faint">Limit</dt><dd>{{max_databases}}</dd></div>
+        </dl>
+        {{#if last_error}}<div class="notice notice-danger mt-4">{{last_error}}</div>{{/if}}
+        <div class="mt-4"><button class="btn btn-ghost" data-db-host-delete="{{id}}">Delete host</button></div>
+      </article>
+    {{else}}
+      <div class="card"><p class="help">No database hosts configured.</p></div>
+    {{/each}}
+  </div>
+</section>
+
+<section class="card">
+  <h2 class="font-semibold">Provision database host</h2>
+  <form id="db-host-create" class="mt-5 grid gap-4 sm:grid-cols-2">
+    <input class="input" name="name" required maxlength="52" placeholder="Primary DB">
+    <select class="input" name="engine"><option value="mariadb">MariaDB 11</option><option value="mysql">MySQL 8.4</option><option value="postgres">PostgreSQL 17</option></select>
+    <input class="input" name="nodeId" required placeholder="Docker node ID">
+    <input class="input" name="port" type="number" min="1024" max="65535" placeholder="Host port (automatic if empty)">
+    <input class="input" name="maxDatabases" type="number" min="1" max="10000" value="100" placeholder="Maximum databases">
+    <div class="sm:col-span-2"><button class="btn" type="submit">Provision host</button><p class="help mt-2">The selected node must have Docker available. Database images are pulled by Docker when required.</p></div>
+  </form>
+</section>
+
+<script type="module" src="/js/pages/databases.js"></script>

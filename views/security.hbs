@@ -1,0 +1,90 @@
+<section class="space-y-6">
+  <div>
+    <p class="text-xs font-semibold uppercase tracking-[0.18em] text-accent">Craftly Security</p>
+    <h1 class="mt-1 text-2xl font-semibold text-ink">Security & Access</h1>
+    <p class="mt-1 text-sm text-ink-soft">Real account sessions, permission profiles, audit visibility and API security controls.</p>
+  </div>
+
+  <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <div class="card"><div class="text-xs text-ink-faint">Users</div><div class="mt-2 text-2xl font-semibold">{{posture.users}}</div></div>
+    <div class="card"><div class="text-xs text-ink-faint">Admins</div><div class="mt-2 text-2xl font-semibold">{{posture.admins}}</div></div>
+    <div class="card"><div class="text-xs text-ink-faint">2FA coverage</div><div class="mt-2 text-2xl font-semibold">{{posture.twoFactorCoverage}}%</div></div>
+    <div class="card"><div class="text-xs text-ink-faint">Active sessions</div><div class="mt-2 text-2xl font-semibold">{{posture.activeSessions}}</div></div>
+  </div>
+
+  <div class="card">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <div><h2 class="font-semibold">Permission profiles</h2><p class="text-sm text-ink-soft">Reusable server-level roles. Built-in profiles cannot be deleted.</p></div>
+      <button id="new-profile" class="btn btn-primary">Create profile</button>
+    </div>
+    <div class="mt-4 overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead><tr class="border-b border-line text-left text-ink-faint"><th class="p-2">Name</th><th class="p-2">Description</th><th class="p-2">Permissions</th><th class="p-2">Action</th></tr></thead>
+        <tbody>
+        {{#each profiles}}
+          <tr class="border-b border-line">
+            <td class="p-2 font-medium">{{name}}</td>
+            <td class="p-2 text-ink-soft">{{description}}</td>
+            <td class="p-2">{{#each permissions}}<span class="mr-1 inline-block rounded bg-panel px-2 py-1 text-xs">{{this}}</span>{{/each}}</td>
+            <td class="p-2">{{#unless (or (eq id 'profile_viewer') (eq id 'profile_operator') (eq id 'profile_manager'))}}<button class="text-red-400 delete-profile" data-id="{{id}}">Delete</button>{{/unless}}</td>
+          </tr>
+        {{/each}}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="flex items-center justify-between gap-3">
+      <div><h2 class="font-semibold">Profile assignments</h2><p class="text-sm text-ink-soft">Current custom server-level role assignments.</p></div>
+      <button id="refresh-security" class="btn btn-secondary">Refresh</button>
+    </div>
+    <div id="assignments" class="mt-4 space-y-2"></div>
+  </div>
+
+  <div class="card">
+    <h2 class="font-semibold">API security</h2>
+    <div class="mt-3 grid gap-3 sm:grid-cols-3">
+      <div><div class="text-xs text-ink-faint">Active API tokens</div><div class="text-xl font-semibold">{{posture.publicApiTokens}}</div></div>
+      <div><div class="text-xs text-ink-faint">Custom profiles</div><div class="text-xl font-semibold">{{posture.permissionProfiles}}</div></div>
+      <div><div class="text-xs text-ink-faint">Custom assignments</div><div class="text-xl font-semibold">{{posture.customPermissionAssignments}}</div></div>
+    </div>
+    <p class="mt-4 text-xs text-ink-faint">Public API tokens remain scoped and revocable. Existing request rate limiting remains enforced by the API middleware.</p>
+  </div>
+</section>
+
+<script>
+(() => {
+  const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  async function load() {
+    const r = await fetch('/api/security/profiles');
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || 'Failed to load security data');
+    document.querySelector('#assignments').innerHTML = j.assignments.length
+      ? j.assignments.map(a => `<div class="flex flex-wrap items-center justify-between gap-2 rounded border border-line p-3"><div><b>${esc(a.username)}</b><span class="mx-2 text-ink-faint">→</span>${esc(a.server_name)}<div class="text-xs text-ink-faint">${esc(a.profile_name)}</div></div><button class="text-red-400 unassign" data-u="${esc(a.user_id)}" data-s="${esc(a.server_id)}">Remove</button></div>`).join('')
+      : '<p class="text-sm text-ink-faint">No custom assignments.</p>';
+    document.querySelectorAll('.unassign').forEach(b => b.onclick = async () => {
+      await fetch('/api/security/profile-assignments/' + encodeURIComponent(b.dataset.u) + '/' + encodeURIComponent(b.dataset.s), {method:'DELETE'});
+      load();
+    });
+  }
+  document.querySelectorAll('.delete-profile').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this permission profile?')) return;
+    const r=await fetch('/api/security/profiles/'+encodeURIComponent(b.dataset.id),{method:'DELETE'});
+    if (!r.ok) { const j=await r.json().catch(()=>({})); alert(j.error || 'Could not delete profile'); return; }
+    location.reload();
+  });
+  document.querySelector('#refresh-security')?.addEventListener('click', load);
+  document.querySelector('#new-profile')?.addEventListener('click', async () => {
+    const name=prompt('Profile name');
+    if (!name) return;
+    const permissions=prompt('Permissions (comma separated)', 'view,console,files');
+    if (!permissions) return;
+    const r=await fetch('/api/security/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,permissions:permissions.split(',').map(s=>s.trim()).filter(Boolean)})});
+    const j=await r.json();
+    if (!r.ok) return alert(j.error || 'Could not create profile');
+    location.reload();
+  });
+  load().catch(e => { document.querySelector('#assignments').textContent = e.message; });
+})();
+</script>

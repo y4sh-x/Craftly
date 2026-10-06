@@ -1,0 +1,537 @@
+﻿'use strict';
+
+// Player statistics: curates the world's vanilla stat files into flat
+// snapshots (player_stat_snapshots), and derives profiles, scoreboards, and
+// the advisory X-ray report from them.
+
+const fsp = require('node:fs/promises');
+const path = require('node:path');
+const db = require('../db');
+const { dataPath } = require('../storage/pathGuard');
+const serversService = require('../services/servers');
+const { activeLevelName } = require('../services/worlds');
+const { uuidToDashed } = require('../services/mojangProfiles');
+const logger = require('../logger')(path.basename(__filename));
+const { serializeError } = require('../utils/logSanitize');
+
+// 'stalled' is still a live container (see liveCache.js's sync()) - keep
+// snapshotting its stats instead of leaving a gap for the stall's duration.
+const RUNNING = new Set(['running', 'starting', 'unhealthy', 'stalled']);
+const STONE_BLOCKS = ['minecraft:stone', 'minecraft:cobblestone', 'minecraft:deepslate', 'minecraft:cobbled_deepslate'];
+const METRICS = new Set([
+  'playtimeTicks',
+  'deaths',
+  'mobKills',
+  'playerKills',
+  'blocksMinedTotal',
+  'stoneMined',
+  'diamondsMined',
+  'ironMined',
+  'ancientDebrisMined',
+  'distanceCm',
+  'damageDealt',
+  'damageTaken',
+  'jumps',
+  'blocksUsedTotal',
+]);
+
+let timer = null;
+
+const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+const sumAll = (obj) => Object.values(obj || {}).reduce((n, v) => n + num(v), 0);
+const pick = (obj, keys) => keys.reduce((n, k) => n + num(obj && obj[k]), 0);
+
+/** Vanilla stats JSON -> curated flat object (stable key order for diffing). */
+function curate(root) {
+  const stats = (root && root.stats) || {};
+  const custom = stats['minecraft:custom'] || {};
+  const mined = stats['minecraft:mined'] || {};
+  let distanceCm = 0;
+  for (const [key, value] of Object.entries(custom)) {
+    if (key.endsWith('_one_cm')) distanceCm += num(value); // walk/sprint/swim/fly/boat/horse/…
+  }
+  return {
+    playtimeTicks: num(custom['minecraft:play_time']) || num(custom['minecraft:play_one_minute']),
+    deaths: num(custom['minecraft:deaths']),
+    mobKills: num(custom['minecraft:mob_kills']),
+    playerKills: num(custom['minecraft:player_kills']),
+    damageDealt: num(custom['minecraft:damage_dealt']),
+    damageTaken: num(custom['minecraft:damage_taken']),
+    jumps: num(custom['minecraft:jump']),
+    distanceCm,
+    blocksMinedTotal: sumAll(mined),
+    stoneMined: pick(mined, STONE_BLOCKS),
+    diamondsMined: pick(mined, ['minecraft:diamond_ore', 'minecraft:deepslate_diamond_ore']),
+    ironMined: pick(mined, ['minecraft:iron_ore', 'minecraft:deepslate_iron_ore']),
+    ancientDebrisMined: num(mined['minecraft:ancient_debris']),
+    // Vanilla has no "blocks placed" stat; minecraft:used counts right-click
+    // uses per item, which is dominated by block placements - good builder proxy.
+    blocksUsedTotal: sumAll(stats['minecraft:used']),
+  };
+}
+
+async function readUsercache(serverId) {
+  const names = new Map();
+  try {
+    const raw = await fsp.readFile(dataPath('servers', serverId, 'usercache.json'), 'utf8');
+    for (const row of JSON.parse(raw)) {
+      const uuid = uuidToDashed(row.uuid);
+      if (uuid && row.name) names.set(uuid, row.name);
+    }
+  } catch {
+    /* no usercache yet */
+  }
+  return names;
+}
+
+async function pathExists(p) {
+  try {
+    await fsp.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read <server>/<level>/stats/*.json and snapshot each player whose curated
+ * stats changed since the last snapshot. Returns { players, snapshots }.
+ *
+ * Uses fs/promises throughout (not the sync API) and awaits each player file
+ * individually: this runs for every tracked player of every RUNNING server on
+ * a 5-minute timer (see startStatsIngest below), and the sync version used to
+ * block the whole event loop - every other request, every WS console/stats
+ * stream - for the full sweep with zero yield points in between.
+ */
+async function ingestStats(serverId) {
+  const server = serversService.getServer(serverId);
+  if (!server) {
+    const err = new Error('Server not found');
+    err.status = 404;
+    throw err;
+  }
+  // activeLevelName honors LEVEL env AND server.properties level-name - a
+  // renamed/activated world would otherwise silently stop producing stats.
+  const level = activeLevelName(server);
+  // MC 26.x moved stat files from <world>/stats to <world>/players/stats.
+  let statsDir;
+  try {
+    const modern = dataPath('servers', serverId, level, 'players', 'stats');
+    const legacy = dataPath('servers', serverId, level, 'stats');
+    statsDir = (await pathExists(modern)) ? modern : legacy;
+  } catch {
+    return { players: 0, snapshots: 0 };
+  }
+  if (!(await pathExists(statsDir))) return { players: 0, snapshots: 0 };
+
+  const names = await readUsercache(serverId);
+  const files = await fsp.readdir(statsDir);
+  // First pass: read + curate every stat file (still async, yielding per file).
+  const rows = [];
+  for (const file of files) {
+    if (!file.endsWith('.json')) continue;
+    const uuid = uuidToDashed(path.basename(file, '.json'));
+    if (!uuid) continue;
+    let curated;
+    try {
+      curated = curate(JSON.parse(await fsp.readFile(path.join(statsDir, file), 'utf8')));
+    } catch {
+      continue; // partial write / malformed file - retry next cycle
+    }
+    rows.push({ uuid, name: names.get(uuid) || '', json: JSON.stringify(curated) });
+  }
+  if (!rows.length) return { players: 0, snapshots: 0 };
+
+  // One lookup for the existing latest snapshot per uuid instead of one SELECT
+  // per player (the N+1 that made a 200-player sweep issue ~200 serial queries
+  // on the event loop).
+  const existing = new Map();
+  const IN_CHUNK = 900; // stay under SQLite's variable-count limit for huge packs
+  for (let i = 0; i < rows.length; i += IN_CHUNK) {
+    const uuids = rows.slice(i, i + IN_CHUNK).map((r) => r.uuid);
+    const placeholders = uuids.map(() => '?').join(',');
+    const sql = `SELECT s.uuid, s.stats_json
+                   FROM player_stat_snapshots s
+                   JOIN (SELECT uuid, MAX(id) AS mid FROM player_stat_snapshots
+                          WHERE server_id = ? AND uuid IN (${placeholders}) GROUP BY uuid) m
+                     ON s.id = m.mid`;
+    for (const r of db.all(sql, serverId, ...uuids)) existing.set(r.uuid, r.stats_json);
+  }
+
+  // Insert only genuinely-changed snapshots, batched in a single transaction.
+  const inserts = [];
+  for (const row of rows) {
+    const prev = existing.get(row.uuid);
+    if (prev === row.json) continue;
+    inserts.push([serverId, row.uuid, row.name, new Date().toISOString(), row.json]);
+  }
+  if (inserts.length) {
+    db.transaction(() => {
+      for (const p of inserts) {
+        db.run(
+          `INSERT INTO player_stat_snapshots (server_id, uuid, name, ts, stats_json) VALUES (?, ?, ?, ?, ?)`,
+          ...p
+        );
+      }
+    });
+  }
+  return { players: rows.length, snapshots: inserts.length };
+}
+
+/** Periodic stat ingestion for all running servers. Returns a stop function. */
+function startStatsIngest({ intervalMs = 5 * 60 * 1000 } = {}) {
+  let ingesting = false;
+  const tick = async () => {
+    // A sweep slower than one interval (many running servers / a slow disk)
+    // must not overlap itself - each pass awaits every player's stat file.
+    if (ingesting) return;
+    ingesting = true;
+    try {
+      for (const server of serversService.listServers()) {
+        if (!RUNNING.has(server.status)) continue;
+        try {
+          await ingestStats(server.id);
+        } catch (err) {
+          logger.warn('Stat ingestion for a server failed.', {
+            serverId: server.id,
+            err: serializeError(err, { includeStack: false }),
+          });
+        }
+      }
+    } finally {
+      ingesting = false;
+    }
+  };
+  tick();
+  timer = setInterval(tick, intervalMs);
+  if (timer.unref) timer.unref();
+  return () => {
+    if (timer) clearInterval(timer);
+    timer = null;
+  };
+}
+
+function latestSnapshot(serverId, uuid) {
+  return db.get(
+    'SELECT * FROM player_stat_snapshots WHERE server_id = ? AND uuid = ? ORDER BY id DESC LIMIT 1',
+    serverId,
+    uuid
+  );
+}
+
+/**
+ * Baseline snapshot for windowed deltas: the newest snapshot at or before the
+ * cutoff; when the player has none that old (snapshots only exist since
+ * tracking started), the oldest snapshot stands in so deltas never exceed
+ * what was actually observed.
+ */
+function baselineSnapshot(serverId, uuid, cutoffIso) {
+  return (
+    db.get(
+      `SELECT * FROM player_stat_snapshots WHERE server_id = ? AND uuid = ? AND ts <= ?
+       ORDER BY ts DESC LIMIT 1`,
+      serverId,
+      uuid,
+      cutoffIso
+    ) ||
+    db.get(
+      'SELECT * FROM player_stat_snapshots WHERE server_id = ? AND uuid = ? ORDER BY ts ASC LIMIT 1',
+      serverId,
+      uuid
+    )
+  );
+}
+
+function windowCutoff(window) {
+  const hours = window === '24h' ? 24 : window === '7d' ? 24 * 7 : null;
+  return hours ? new Date(Date.now() - hours * 3_600_000).toISOString() : null;
+}
+
+// Aggregate the "latest snapshot per uuid" for a set of uuids in ONE query per
+// chunk, instead of a per-uuid SELECT (the N+1 behind scoreboard/xray on a cold
+// memo cache). Returns a Map<uuid, row>.
+function latestSnapshotsBulk(serverId, uuids) {
+  const out = new Map();
+  const CHUNK = 900;
+  for (let i = 0; i < uuids.length; i += CHUNK) {
+    const chunk = uuids.slice(i, i + CHUNK);
+    const ph = chunk.map(() => '?').join(',');
+    const sql = `SELECT s.* FROM player_stat_snapshots s
+                 JOIN (SELECT uuid, MAX(id) AS mid FROM player_stat_snapshots
+                        WHERE server_id = ? AND uuid IN (${ph}) GROUP BY uuid) m
+                   ON s.id = m.mid`;
+    for (const r of db.all(sql, serverId, ...chunk)) out.set(r.uuid, r);
+  }
+  return out;
+}
+
+// Aggregate the "newest snapshot with ts <= cutoff" per uuid in one pass, then
+// fill the fallback (oldest snapshot) for uuids with nothing before the cutoff -
+// matching baselineSnapshot()'s semantics without per-uuid queries.
+function baselineSnapshotsBulk(serverId, uuids, cutoffIso) {
+  const out = new Map();
+  const CHUNK = 900;
+  for (let i = 0; i < uuids.length; i += CHUNK) {
+    const chunk = uuids.slice(i, i + CHUNK);
+    const ph = chunk.map(() => '?').join(',');
+    const sql = `SELECT s.* FROM player_stat_snapshots s
+                 JOIN (SELECT uuid, MAX(ts) AS mts FROM player_stat_snapshots
+                        WHERE server_id = ? AND uuid IN (${ph}) AND ts <= ? GROUP BY uuid) m
+                   ON s.server_id = ? AND s.uuid = m.uuid AND s.ts = m.mts`;
+    for (const r of db.all(sql, serverId, ...chunk, cutoffIso, serverId)) out.set(r.uuid, r);
+  }
+  const missing = uuids.filter((uuid) => !out.has(uuid));
+  for (let i = 0; i < missing.length; i += CHUNK) {
+    const chunk = missing.slice(i, i + CHUNK);
+    const ph = chunk.map(() => '?').join(',');
+    const sql = `SELECT s.* FROM player_stat_snapshots s
+                 JOIN (SELECT uuid, MIN(ts) AS mts FROM player_stat_snapshots
+                        WHERE server_id = ? AND uuid IN (${ph}) GROUP BY uuid) m
+                   ON s.uuid = m.uuid AND s.ts = m.mts`;
+    for (const r of db.all(sql, serverId, ...chunk)) out.set(r.uuid, r);
+  }
+  return out;
+}
+
+function deltaBetween(latest, base) {
+  const out = {};
+  for (const key of METRICS) out[key] = Math.max(0, num(latest[key]) - num(base ? base[key] : 0));
+  return out;
+}
+
+/**
+ * Playstyle heuristic (percentages of the four normalized scores):
+ *   miner    = blocks broken
+ *   builder  = minecraft:used total (right-click uses ≈ blocks placed; vanilla
+ *              has no direct "placed" stat) - falls back to jumps when zero
+ *   fighter  = 25 * (mobKills + 4 * playerKills) + damageDealt / 10
+ *   explorer = distanceCm / 1600 (16 m traveled weighted like one block mined)
+ * The scale factors put a typical hour of each activity in the same order of
+ * magnitude so the split reflects how time is actually spent.
+ */
+function playstyle(stats) {
+  const scores = {
+    miner: stats.blocksMinedTotal,
+    builder: stats.blocksUsedTotal > 0 ? stats.blocksUsedTotal : stats.jumps / 2,
+    fighter: 25 * (stats.mobKills + 4 * stats.playerKills) + stats.damageDealt / 10,
+    explorer: stats.distanceCm / 1600,
+  };
+  const total = Object.values(scores).reduce((n, v) => n + v, 0);
+  const pct = {};
+  for (const [key, value] of Object.entries(scores)) {
+    pct[key] = total > 0 ? Math.round((value / total) * 100) : 0;
+  }
+  return pct;
+}
+
+/** Full profile for one player: latest stats, 24h/7d deltas, playstyle, sessions. */
+function profile(serverId, uuid) {
+  const dashed = uuidToDashed(uuid) || uuid;
+  const row = latestSnapshot(serverId, dashed);
+  if (!row) return null;
+  const stats = JSON.parse(row.stats_json);
+  const deltas = {};
+  for (const window of ['24h', '7d']) {
+    const base = baselineSnapshot(serverId, dashed, windowCutoff(window));
+    deltas[window] = deltaBetween(stats, base ? JSON.parse(base.stats_json) : null);
+  }
+
+  const name = row.name || '';
+  const sessionAgg = name
+    ? db.get(
+        `SELECT COUNT(*) AS count,
+                SUM(CASE WHEN ended_at IS NOT NULL
+                    THEN (julianday(ended_at) - julianday(started_at)) * 86400 ELSE 0 END) AS closed_seconds
+         FROM player_sessions WHERE server_id = ? AND player = ?`,
+        serverId,
+        name
+      )
+    : { count: 0, closed_seconds: 0 };
+  const recentSessions = name
+    ? db
+        .all(
+          `SELECT started_at, ended_at FROM player_sessions WHERE server_id = ? AND player = ?
+         ORDER BY started_at DESC LIMIT 10`,
+          serverId,
+          name
+        )
+        .map((s) => ({
+          startedAt: s.started_at,
+          endedAt: s.ended_at,
+          durationSec: Math.max(
+            0,
+            Math.round(((s.ended_at ? Date.parse(s.ended_at) : Date.now()) - Date.parse(s.started_at)) / 1000)
+          ),
+          open: !s.ended_at,
+        }))
+    : [];
+
+  return {
+    uuid: dashed,
+    name,
+    updatedAt: row.ts,
+    stats,
+    deltas,
+    playstyle: playstyle(stats),
+    playtimeSeconds: Math.round(stats.playtimeTicks / 20),
+    sessions: {
+      count: Number(sessionAgg.count) || 0,
+      closedSeconds: Math.round(Number(sessionAgg.closed_seconds) || 0),
+      last: recentSessions[0] || null,
+      recent: recentSessions,
+    },
+  };
+}
+
+// scoreboard()/xrayReport() fan out to a per-uuid query + JSON.parse of every
+// snapshot and then sort/median in JS - all of it repeated on every metrics-tab
+// load. Memoize the finished report and only recompute when the server's
+// snapshot set actually changes (newest ts + row count catch both an ingest and
+// a retention prune). Windowed leaderboards also key on a coarse time bucket so
+// a moving "last 7d" boundary doesn't serve a stale delta indefinitely.
+// Bounded LRU: windowed leaderboards mix a 5-minute time bucket into their key,
+// so every (server, metric, window) combo mints a fresh, permanently-dead entry
+// every 5 minutes. Cap the map and evict the least-recently-used so the cache
+// can't grow with uptime.
+const reportCache = new Map();
+const REPORT_CACHE_MAX = 500;
+function memoizeBySnapshots(serverId, key, compute) {
+  const s = db.get('SELECT MAX(ts) AS t, COUNT(*) AS n FROM player_stat_snapshots WHERE server_id = ?', serverId);
+  const stamp = `${(s && s.t) || ''}:${(s && s.n) || 0}`;
+  const cacheKey = `${serverId}::${key}`;
+  const hit = reportCache.get(cacheKey);
+  if (hit && hit.stamp === stamp) {
+    reportCache.delete(cacheKey);
+    reportCache.set(cacheKey, hit); // move to most-recently-used
+    return hit.value;
+  }
+  const value = compute();
+  reportCache.set(cacheKey, { stamp, value });
+  if (reportCache.size > REPORT_CACHE_MAX) reportCache.delete(reportCache.keys().next().value);
+  return value;
+}
+
+/** Rank every tracked player by one metric, absolute or windowed delta. */
+function scoreboard(serverId, { metric = 'playtimeTicks', window = 'all' } = {}) {
+  if (!METRICS.has(metric)) {
+    const err = new Error(`Unknown metric: ${metric}`);
+    err.status = 400;
+    throw err;
+  }
+  const timeBucket = window === 'all' ? '' : Math.floor(Date.now() / 300_000);
+  return memoizeBySnapshots(serverId, `sb:${metric}:${window}:${timeBucket}`, () =>
+    computeScoreboard(serverId, metric, window)
+  );
+}
+
+function computeScoreboard(serverId, metric, window) {
+  const cutoff = windowCutoff(window);
+  const uuids = db
+    .all('SELECT DISTINCT uuid FROM player_stat_snapshots WHERE server_id = ?', serverId)
+    .map((r) => r.uuid);
+  const latestMap = latestSnapshotsBulk(serverId, uuids);
+  const baseMap = cutoff ? baselineSnapshotsBulk(serverId, uuids, cutoff) : null;
+  const rows = [];
+  for (const uuid of uuids) {
+    const latest = latestMap.get(uuid);
+    if (!latest) continue;
+    const stats = JSON.parse(latest.stats_json);
+    let value = num(stats[metric]);
+    if (cutoff) {
+      const base = baseMap.get(uuid);
+      value = Math.max(0, value - num(base ? JSON.parse(base.stats_json)[metric] : 0));
+    }
+    rows.push({ uuid, name: latest.name || uuid.slice(0, 8), value });
+  }
+  rows.sort((a, b) => b.value - a.value || a.name.localeCompare(b.name));
+  return rows.map((row, i) => ({ ...row, rank: i + 1, crown: i === 0 && row.value > 0 }));
+}
+
+const median = (values) => {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+};
+
+/**
+ * Advisory X-ray heuristic: each player's diamond/(stone+1) and ancient-debris
+ * ratios vs the server median (players with >= 64 stone mined). Flags ratios
+ * over 4x median with at least 16 diamonds - evidence only, never punitive.
+ */
+function xrayReport(serverId) {
+  return memoizeBySnapshots(serverId, 'xray', () => computeXrayReport(serverId));
+}
+
+// Count of elements <= v in an ascending-sorted array. The per-player percentile
+// used to be a ratios.filter(...) inside the players.map - O(N²) on the whole
+// field once player counts grow. Binary search makes the report O(N log N).
+function countLE(sorted, v) {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid] <= v) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function computeXrayReport(serverId) {
+  const uuids = db
+    .all('SELECT DISTINCT uuid FROM player_stat_snapshots WHERE server_id = ?', serverId)
+    .map((r) => r.uuid);
+  const latestMap = latestSnapshotsBulk(serverId, uuids);
+  const players = uuids
+    .map((uuid) => latestMap.get(uuid))
+    .filter(Boolean)
+    .map((latest) => {
+      const s = JSON.parse(latest.stats_json);
+      return {
+        uuid: latest.uuid,
+        name: latest.name || latest.uuid.slice(0, 8),
+        stoneMined: s.stoneMined,
+        diamondsMined: s.diamondsMined,
+        ancientDebrisMined: s.ancientDebrisMined,
+        diamondRatio: s.diamondsMined / (s.stoneMined + 1),
+        debrisRatio: s.ancientDebrisMined / (s.stoneMined + 1),
+      };
+    });
+
+  const eligible = players.filter((p) => p.stoneMined >= 64);
+  const medDiamond = median(eligible.map((p) => p.diamondRatio));
+  const medDebris = median(eligible.map((p) => p.debrisRatio));
+  // Floor keeps a lone miner on a fresh server from dividing by a zero median.
+  const effDiamond = Math.max(medDiamond, 0.001);
+  const effDebris = Math.max(medDebris, 0.0005);
+
+  const ratios = players.map((p) => p.diamondRatio).sort((a, b) => a - b);
+  const out = players
+    .map((p) => {
+      const flaggedDiamond = p.stoneMined >= 64 && p.diamondsMined >= 16 && p.diamondRatio > 4 * effDiamond;
+      const flaggedDebris = p.stoneMined >= 64 && p.ancientDebrisMined >= 8 && p.debrisRatio > 4 * effDebris;
+      return {
+        ...p,
+        diamondRatio: Number(p.diamondRatio.toFixed(5)),
+        debrisRatio: Number(p.debrisRatio.toFixed(5)),
+        percentile: ratios.length > 1 ? Math.round((countLE(ratios, p.diamondRatio) / ratios.length) * 100) : 100,
+        flagged: flaggedDiamond || flaggedDebris,
+        reasons: [
+          ...(flaggedDiamond ? [`diamond ratio ${(p.diamondRatio / effDiamond).toFixed(1)}x server median`] : []),
+          ...(flaggedDebris ? [`ancient debris ratio ${(p.debrisRatio / effDebris).toFixed(1)}x server median`] : []),
+        ],
+      };
+    })
+    .sort((a, b) => b.diamondRatio - a.diamondRatio);
+
+  return {
+    advisory: true,
+    sampleSize: eligible.length,
+    medianDiamondRatio: Number(medDiamond.toFixed(5)),
+    medianDebrisRatio: Number(medDebris.toFixed(5)),
+    players: out,
+    flagged: out.filter((p) => p.flagged),
+  };
+}
+
+module.exports = { ingestStats, startStatsIngest, profile, scoreboard, xrayReport, curate };

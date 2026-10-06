@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{title}} · Craftly</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  {{! "Add to Home Screen" on iOS/Android - manifest.json covers Android/Chrome;
+      iOS ignores the manifest's icons entirely and needs its own apple-touch-icon
+      and apple-mobile-web-app-* tags to behave like an installed app. }}
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <meta name="theme-color" content="#2f8520">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Craftly">
+  <link rel="stylesheet" href="/css/app.css">
+  <link rel="stylesheet" href="/css/craftly-themes.css">
+  <script nonce="{{cspNonce}}">
+    // Apply persisted theme before first paint to avoid a flash.
+    try {
+      var t = localStorage.getItem('craftly-theme');
+      if (!t) t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'forge';
+      document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  </script>
+</head>
+<body class="min-h-screen">
+  <div class="flex min-h-screen">
+    {{> sidebar}}
+
+    <div class="flex min-w-0 flex-1 flex-col">
+      {{> topbar}}
+      <main class="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6 lg:px-8">
+        {{{body}}}
+      </main>
+      <footer class="border-t border-line px-6 py-3 text-xs text-ink-faint">
+        Craftly <span class="text-ink-soft">v{{appVersion}}</span> &middot; a control panel for Minecraft servers on Docker
+      </footer>
+    </div>
+  </div>
+
+  <div id="toasts" class="fixed bottom-[calc(1rem+env(safe-area-inset-bottom))] right-[calc(1rem+env(safe-area-inset-right))] z-[65] flex w-80 max-w-[calc(100vw-2rem)] flex-col gap-2"></div>
+  {{#if panelLocalization}}<script nonce="{{cspNonce}}">window.Craftly = Object.assign(window.Craftly || {}, {{jsonScript panelLocalization}});</script>{{/if}}
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

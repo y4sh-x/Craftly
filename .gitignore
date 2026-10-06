@@ -1,0 +1,21 @@
+# Application data (worlds, mods, backups, DB, generated secret - everything lives here)
+data/
+
+node_modules/
+public/css/app.css
+public/dist/
+.env
+
+# CodeGraph index
+.codegraph/
+
+# Claude Code — keep shared commands, ignore local plans
+.claude/plans/
+
+
+# Logs / editor / OS noise
+*.log
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

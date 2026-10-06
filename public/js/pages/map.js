@@ -1,0 +1,88 @@
+// Map tab: enable/disable BlueMap, plus a probe so the embed never shows the
+// proxy's raw error page while the map isn't serving yet.
+import { toast } from '../lib/toast.js';
+import { friendlyError } from '../lib/errors.js';
+import { confirmDialog } from '../lib/confirm.js';
+import { setBusy } from '../lib/loading.js';
+
+// ---- Probe the map endpoint; swap in the styled placeholder while it's down ----
+(() => {
+  const frame = document.querySelector('[data-map-frame]');
+  const placeholder = document.querySelector('[data-map-placeholder]');
+  if (!frame || !placeholder) return;
+  let retry = 10000;
+  async function probe() {
+    let up = false;
+    try {
+      // GET, not HEAD: the iframe only ever GETs this URL, and BlueMap's
+      // bundled webserver isn't guaranteed to implement HEAD - a HEAD-only
+      // probe could report "down" forever even once the map is genuinely up.
+      up = (await fetch(frame.dataset.src || frame.src, { method: 'GET' })).ok;
+    } catch {
+      /* down */
+    }
+    if (up) {
+      if (frame.dataset.src) {
+        frame.src = frame.dataset.src; // (re)load only once it actually serves
+        delete frame.dataset.src;
+      }
+      frame.classList.remove('hidden');
+      placeholder.classList.add('hidden');
+      placeholder.classList.remove('grid');
+    } else {
+      if (!frame.dataset.src) frame.dataset.src = frame.src; // park the URL, blank the frame
+      frame.removeAttribute('src');
+      frame.classList.add('hidden');
+      placeholder.classList.remove('hidden');
+      placeholder.classList.add('grid');
+      setTimeout(probe, retry);
+      retry = Math.min(retry * 1.5, 60000);
+    }
+  }
+  probe();
+})();
+
+document.addEventListener('click', async (e) => {
+  const enableBtn = e.target.closest('[data-map-enable]');
+  const disableBtn = e.target.closest('[data-map-disable]');
+  if (!enableBtn && !disableBtn) return;
+  const id = (enableBtn || disableBtn).dataset.serverId;
+
+  if (enableBtn) {
+    const restore = setBusy(enableBtn, 'Installing…');
+    toast('Installing BlueMap and allocating the map port…', { kind: 'info' });
+    try {
+      const res = await fetch(`/api/servers/${id}/map/enable`, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        toast('Live map enabled. Restart the server to bring it up.');
+        setTimeout(() => location.reload(), 900);
+      } else {
+        toast(data.error || friendlyError(res, { action: 'enable the live map' }), { kind: 'error', timeout: 9000 });
+      }
+    } finally {
+      restore();
+    }
+  } else {
+    const ok = await confirmDialog({
+      title: 'Disable the live map?',
+      message: 'Removes BlueMap from this server. Rendered map tiles stay on disk until you delete them from Files.',
+      confirmLabel: 'Disable',
+      danger: true,
+    });
+    if (!ok) return;
+    const restore = setBusy(disableBtn, 'Disabling…');
+    try {
+      const res = await fetch(`/api/servers/${id}/map/disable`, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        toast('Live map disabled. Applies on the next restart.');
+        setTimeout(() => location.reload(), 900);
+      } else {
+        toast(data.error || friendlyError(res, { action: 'disable the live map' }), { kind: 'error' });
+      }
+    } finally {
+      restore();
+    }
+  }
+});

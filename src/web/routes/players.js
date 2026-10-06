@@ -1,0 +1,421 @@
+﻿'use strict';
+
+// Player management API. Mounted at /api/servers/:id/players (mergeParams
+// carries :id down from the mount point).
+
+const asyncHandler = require('../middleware/asyncHandler');
+const { makeJsonErrorHandler } = require('../middleware/jsonErrorHandler');
+const express = require('express');
+const { z } = require('zod');
+const servers = require('../../services/servers');
+const players = require('../../services/players');
+const playerNotes = require('../../services/playerNotes');
+const { resolveSkin, getSkinImage } = require('../../services/skins');
+const { inspectStatus } = require('../../docker/containers');
+const biomes = require('../../config/biomes');
+const { PLAYER_NAME_RE } = require('../../utils/playerName');
+const logger = require('../../logger')('players-api');
+const { serializeError } = require('../../utils/logSanitize');
+
+const router = express.Router({ mergeParams: true });
+
+const RUNNING_STATES = new Set(['running', 'unhealthy']); // rcon still answers while unhealthy
+
+const nameSchema = z
+  .string()
+  .trim()
+  .regex(PLAYER_NAME_RE, 'Player names are 1-16 letters, digits or _ (a leading . or * for Bedrock players is fine)');
+const reasonSchema = z.string().trim().max(256).optional();
+const ipSchema = z
+  .string()
+  .trim()
+  .regex(/^[0-9a-fA-F.:]{3,45}$/, 'Enter a valid IPv4 or IPv6 address.');
+// Cap at 10 years - a "duration" past that is just a permanent ban with extra steps.
+const durationSchema = z.coerce
+  .number()
+  .int()
+  .positive()
+  .max(10 * 365 * 24 * 3600 * 1000)
+  .optional();
+
+const whitelistSchema = z.object({ name: nameSchema, on: z.coerce.boolean() });
+const enforceSchema = z.object({ on: z.coerce.boolean() });
+const opSchema = z.object({
+  name: nameSchema,
+  on: z.coerce.boolean(),
+  level: z.coerce.number().int().min(1).max(4).optional(),
+});
+const banSchema = z.object({ name: nameSchema, reason: reasonSchema, durationMs: durationSchema });
+const pardonSchema = z.object({ name: nameSchema });
+const banIpSchema = z.object({
+  ip: ipSchema,
+  reason: reasonSchema,
+  durationMs: durationSchema,
+  player: nameSchema.optional(),
+});
+const pardonIpSchema = z.object({ ip: ipSchema });
+const noteSchema = z.object({ name: nameSchema, note: z.string().trim().min(1).max(1000) });
+const kickSchema = z.object({ name: nameSchema, message: z.string().trim().max(256).optional() });
+const teleportSchema = z.discriminatedUnion('mode', [
+  z.object({
+    mode: z.literal('coords'),
+    player: nameSchema,
+    x: z.coerce.number().finite(),
+    // Y omitted/empty = land on the surface (spreadplayers) - never mid-air.
+    y: z.preprocess(
+      (v) => (v === '' || v === null || v === undefined ? undefined : v),
+      z.coerce.number().finite().optional()
+    ),
+    z: z.coerce.number().finite(),
+    dimension: z.enum(['minecraft:overworld', 'minecraft:the_nether', 'minecraft:the_end']).optional(),
+    safe: z.coerce.boolean().optional(),
+  }),
+  z.object({ mode: z.literal('player'), player: nameSchema, target: nameSchema }),
+  z.object({
+    mode: z.literal('biome'),
+    player: nameSchema,
+    biome: z
+      .string()
+      .trim()
+      .regex(/^[a-z0-9_.-]+:[a-z0-9_/.-]+$/),
+  }),
+  z.object({
+    mode: z.literal('rtp'),
+    player: nameSchema,
+    minDistance: z.coerce.number().int().min(0).max(1000000).optional(),
+    maxDistance: z.coerce.number().int().min(16).max(1000000).optional(),
+    center: z.enum(['player', 'origin']).optional(),
+  }),
+  z.object({
+    mode: z.literal('structure'),
+    player: nameSchema,
+    structure: z
+      .string()
+      .trim()
+      .regex(/^#?[a-z0-9_.-]+:[a-z0-9_/.-]+$/),
+    random: z.coerce.boolean().optional(),
+    maxDistance: z.coerce.number().int().min(16).max(1000000).optional(),
+  }),
+]);
+
+/** 404 unless the server exists; resolve whether rcon is available. */
+async function loadContext(req) {
+  const server = servers.getServer(req.params.id);
+  if (!server) {
+    const err = new Error('Server not found');
+    err.status = 404;
+    throw err;
+  }
+  let running = false;
+  try {
+    const info = await inspectStatus(server.id);
+    running = info.exists && RUNNING_STATES.has(info.status);
+  } catch {
+    // intentional: Docker down - fall back to file edits, `running` stays false
+  }
+  return { server, ctx: { running, actor: req.user.username } };
+}
+
+router.get(
+  '/',
+  asyncHandler(async (req, res, next) => {
+    const { server, ctx } = await loadContext(req);
+    const onlineNames = ctx.running ? await players.listOnlineNames(server.id) : [];
+    res.json({
+      ok: true,
+      running: ctx.running,
+      players: players.listPlayers(server.id, onlineNames),
+      bannedIps: players.listBannedIps(server.id),
+      whitelistEnforced: players.getWhitelistEnforced(server.id),
+    });
+  })
+);
+
+// Skin lookup for the roster's head images. Returns { url, model } or null
+// when Mojang has no profile for that uuid. Best-effort: a failure here is the
+// signal for the UI to keep its placeholder head, never an error page.
+router.get(
+  '/skin/:uuid',
+  asyncHandler(async (req, res, next) => {
+    const uuid = z
+      .string()
+      .trim()
+      .regex(/^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i)
+      .parse(req.params.uuid);
+    try {
+      res.json({ ok: true, skin: await resolveSkin(uuid) });
+    } catch (err) {
+      logger.debug('Could not resolve a skin; the UI will use a placeholder head.', {
+        uuid,
+        err: serializeError(err, { includeStack: false }),
+      });
+      res.json({ ok: true, skin: null });
+    }
+  })
+);
+
+// Prefetch skins for a batch of uuids so later /skin-image/:uuid requests are
+// served from the SQLite/memory caches instead of each waiting on the Mojang
+// session API. Runs the upstream lookups in parallel (bounded), then returns
+// quickly - the client fires the individual head requests right after.
+router.post(
+  '/skin-prefetch',
+  asyncHandler(async (req, res, next) => {
+    const { uuids } = z
+      .object({
+        uuids: z
+          .array(
+            z
+              .string()
+              .trim()
+              .regex(/^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i)
+          )
+          .max(128),
+      })
+      .parse(req.body || {});
+    const unique = [...new Set(uuids)];
+    const LIMIT = 8;
+    let cursor = 0;
+    const worker = async () => {
+      for (;;) {
+        const uuid = unique[cursor++];
+        if (uuid === undefined) return;
+        try {
+          const skin = await resolveSkin(uuid);
+          if (skin && skin.url) {
+            await getSkinImage(skin.url).catch(() => null);
+          }
+        } catch {
+          /* best-effort; individual requests handle the fallback */
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(LIMIT, unique.length) }, worker));
+    res.json({ ok: true, prefetched: unique.length });
+  })
+);
+
+// Streams a player's skin texture PNG same-origin (so the client canvas can
+// crop the face without the texture CDN tainting it). Long-lived + immutable
+// cache: texture URLs are content-addressed, so the bytes never change.
+router.get(
+  '/skin-image/:uuid',
+  asyncHandler(async (req, res, next) => {
+    const uuid = z
+      .string()
+      .trim()
+      .regex(/^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i)
+      .parse(req.params.uuid);
+    let url;
+    try {
+      const skin = await resolveSkin(uuid);
+      url = skin && skin.url;
+      if (!url) return res.sendStatus(404);
+      const buffer = await getSkinImage(url);
+      res.set('Content-Type', 'image/png');
+      res.set('Cache-Control', 'public, max-age=31536000, immutable');
+      res.send(buffer);
+    } catch (err) {
+      logger.debug('Could not proxy a skin texture; the UI will use a placeholder head.', {
+        uuid,
+        err: serializeError(err, { includeStack: false }),
+      });
+      res.sendStatus(500);
+    }
+  })
+);
+
+router.get('/structures', async (req, res) => {
+  try {
+    const { ctx } = await loadContext(req);
+    res.json({ ok: true, structures: await players.getServerStructures(req.params.id, { running: ctx.running }) });
+  } catch (err) {
+    logger.debug('Could not build the structure list; returning an empty list.', {
+      serverId: req.params.id,
+      err: serializeError(err, { includeStack: false }),
+    });
+    res.json({ ok: true, structures: [] });
+  }
+});
+
+router.get('/biomes', async (req, res, next) => {
+  try {
+    // Server-derived registry when possible (modded packs add biomes the
+    // bundled vanilla list can't know); bundled fallback otherwise. Each biome is
+    // tagged with its "special" (non-overworld) home dimension for the UI prefix.
+    const { ctx } = await loadContext(req);
+    const registry = await players.getServerBiomes(req.params.id, { running: ctx.running });
+    const seen = new Map();
+    for (const b of registry.biomes) {
+      if (seen.has(b.id)) continue;
+      const dims = registry.byId.get(b.id) || [b.dimension];
+      const primary = dims.find((d) => d && d !== 'minecraft:overworld') || dims[0] || 'minecraft:overworld';
+      seen.set(b.id, { id: b.id, dimension: primary });
+    }
+    const list = [...seen.values()];
+    res.json({ ok: true, biomes: list, source: list.length > 70 ? 'server' : 'bundled' });
+  } catch (err) {
+    logger.debug('Could not build the server biome registry; returning the bundled list.', {
+      serverId: req.params.id,
+      err: serializeError(err, { includeStack: false }),
+    });
+    res.json({ ok: true, biomes: biomes.map((id) => ({ id, dimension: 'minecraft:overworld' })), source: 'bundled' });
+  }
+});
+
+router.post(
+  '/whitelist',
+  asyncHandler(async (req, res, next) => {
+    const { name, on } = whitelistSchema.parse(req.body);
+    const { server, ctx } = await loadContext(req);
+    res.json({ ok: true, result: await players.setWhitelisted(server.id, name, on, ctx) });
+  })
+);
+
+router.post(
+  '/whitelist-enforce',
+  asyncHandler(async (req, res, next) => {
+    const { on } = enforceSchema.parse(req.body);
+    const { server, ctx } = await loadContext(req);
+    res.json({ ok: true, result: await players.setWhitelistEnforced(server.id, on, ctx) });
+  })
+);
+
+router.post(
+  '/op',
+  asyncHandler(async (req, res, next) => {
+    const { name, on, level } = opSchema.parse(req.body);
+    const { server, ctx } = await loadContext(req);
+    res.json({ ok: true, result: await players.setOp(server.id, name, on, level ?? 4, ctx) });
+  })
+);
+
+router.post(
+  '/ban',
+  asyncHandler(async (req, res, next) => {
+    const { name, reason, durationMs } = banSchema.parse(req.body);
+    const { server, ctx } = await loadContext(req);
+    res.json({ ok: true, result: await players.banPlayer(server.id, name, reason, { ...ctx, durationMs }) });
+  })
+);
+
+router.post(
+  '/pardon',
+  asyncHandler(async (req, res, next) => {
+    const { name } = pardonSchema.parse(req.body);
+    const { server, ctx } = await loadContext(req);
+    res.json({ ok: true, result: await players.pardonPlayer(server.id, name, ctx) });
+  })
+);
+
+router.post(
+  '/ban-ip',
+  asyncHandler(async (req, res, next) => {
+    const { ip, reason, durationMs, player } = banIpSchema.parse(req.body);
+    const { server, ctx } = await loadContext(req);
+    res.json({ ok: true, result: await players.banIp(server.id, ip, reason, { ...ctx, durationMs, player }) });
+  })
+);
+
+router.post(
+  '/pardon-ip',
+  asyncHandler(async (req, res, next) => {
+    const { ip } = pardonIpSchema.parse(req.body);
+    const { server, ctx } = await loadContext(req);
+    res.json({ ok: true, result: await players.pardonIp(server.id, ip, ctx) });
+  })
+);
+
+router.delete(
+  '/:name',
+  asyncHandler(async (req, res, next) => {
+    const name = nameSchema.parse(req.params.name);
+    const { server, ctx } = await loadContext(req);
+    res.json({ ok: true, result: await players.deletePlayer(server.id, name, ctx) });
+  })
+);
+
+router.post(
+  '/kick',
+  asyncHandler(async (req, res, next) => {
+    const { name, message } = kickSchema.parse(req.body);
+    const { server, ctx } = await loadContext(req);
+    res.json({ ok: true, result: await players.kickPlayer(server.id, name, message, ctx) });
+  })
+);
+
+router.post(
+  '/teleport',
+  asyncHandler(async (req, res, next) => {
+    const body = teleportSchema.parse(req.body);
+    const { server, ctx } = await loadContext(req);
+    // One teleport at a time per server - parallel /locate searches stall the
+    // server's main thread hard enough to time out every online player.
+    const result = await players.withTeleportSlot(server.id, async () => {
+      if (body.mode === 'coords') {
+        return players.tpToCoords(
+          server.id,
+          body.player,
+          { x: body.x, y: body.y, z: body.z, dimension: body.dimension, safe: body.safe !== false },
+          ctx
+        );
+      }
+      if (body.mode === 'player') {
+        return players.tpToPlayer(server.id, body.player, body.target, ctx);
+      }
+      if (body.mode === 'rtp') {
+        return players.rtpPlayer(
+          server.id,
+          body.player,
+          { minDistance: body.minDistance, maxDistance: body.maxDistance, center: body.center },
+          ctx
+        );
+      }
+      if (body.mode === 'structure') {
+        return players.tpToStructure(
+          server.id,
+          body.player,
+          body.structure,
+          { random: body.random !== false, maxDistance: body.maxDistance },
+          ctx
+        );
+      }
+      return players.tpToBiome(server.id, body.player, body.biome, ctx);
+    });
+    res.json({ ok: true, result });
+  })
+);
+
+router.get(
+  '/notes',
+  asyncHandler(async (req, res, next) => {
+    const { name } = z.object({ name: nameSchema }).parse(req.query);
+    const { server } = await loadContext(req);
+    const who = await players.resolveIdentity(server.id, name);
+    res.json({ ok: true, notes: playerNotes.listNotes(server.id, who.uuid) });
+  })
+);
+
+router.post(
+  '/notes',
+  asyncHandler(async (req, res, next) => {
+    const { name, note } = noteSchema.parse(req.body);
+    const { server, ctx } = await loadContext(req);
+    const who = await players.resolveIdentity(server.id, name);
+    res.json({ ok: true, note: playerNotes.addNote(server.id, who, note, ctx) });
+  })
+);
+
+router.delete(
+  '/notes/:noteId',
+  asyncHandler(async (req, res, next) => {
+    const { server, ctx } = await loadContext(req);
+    playerNotes.deleteNote(server.id, req.params.noteId, ctx);
+    res.json({ ok: true });
+  })
+);
+
+// JSON error handler for this subtree (mirrors routes/api.js)
+router.use(makeJsonErrorHandler('players-api'));
+
+module.exports = router;

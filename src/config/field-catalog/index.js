@@ -1,0 +1,99 @@
+'use strict';
+
+// FIELD CATALOG - the single source of truth for every configurable setting
+// the panel exposes: itzg env vars, Docker resource limits, server.properties
+// keys, and panel settings. Forms render from it; server-side validation is
+// derived from it; nothing anywhere shows a raw env var without its friendly
+// label and help text.
+//
+// Entry schema (all sections use it):
+// {
+//   key:      'MEMORY'                    // env var name, or property key for scope 'properties'
+//   scope:    'env' | 'docker' | 'properties' | 'panel'
+//   label:    'RAM (Java heap)'           // friendly, human
+//   help:     '1-2 sentences of plain English, sourced from the itzg docs.'
+//   type:     'text'|'number'|'size-mb'|'boolean'|'enum'|'list'|'password'|'range'|'cron'|'duration'
+//   unit:     'MB' | 'cores' | 'players' | … (optional)
+//   default:  value the image/panel uses when unset (optional)
+//   options:  [{value, label, desc?}] for enum (optional)
+//   min, max, step: for number/range (optional)
+//   mode:     'simple' | 'advanced'       // which wizard mode shows it
+//   section:  section id (matches SECTIONS below)
+//   danger:   true → red styling + extra warning copy (optional)
+//   requiresRestart: true when a running container must be recreated to apply
+//   prop:     server.properties key this env var maps to (optional). The itzg
+//             image re-asserts env-backed properties on every start, so any
+//             direct server.properties edit of this key un-sets the env var
+//             (see services/servers.js writeServerProperties) - the file then
+//             becomes the source of truth instead of being reverted.
+//   hidden:   true → never rendered (footguns the panel manages itself)
+//   note:     short 'recommended' hint or warning shown as a badge (optional)
+//   conflictsWith: key of another boolean field that must not be on at the
+//             same time (optional) - the form auto-unchecks it, so this needs
+//             a note explaining the conflict in plain English too; the badge
+//             alone is easy to miss and doesn't stop anyone from checking both.
+// }
+
+const SECTIONS = [
+  { id: 'identity', label: 'Identity', icon: 'tag' },
+  { id: 'flavor', label: 'Flavor & Version', icon: 'box' },
+  { id: 'resources', label: 'Resources', icon: 'gauge' },
+  { id: 'jvm', label: 'Java / JVM Tuning', icon: 'wrench' },
+  { id: 'world', label: 'World', icon: 'earth' },
+  { id: 'gameplay', label: 'Gameplay Rules', icon: 'swords' },
+  { id: 'players', label: 'Players, Whitelist & Ops', icon: 'users' },
+  { id: 'network', label: 'Networking & Ports', icon: 'network' },
+  { id: 'rcon', label: 'RCON & Console', icon: 'terminal' },
+  { id: 'packs', label: 'Modpacks & Content', icon: 'package' },
+  { id: 'autopause', label: 'Auto-Pause / Auto-Stop', icon: 'pause' },
+  { id: 'maintenance', label: 'Logs & Maintenance', icon: 'file-text' },
+  { id: 'advanced', label: 'Advanced & Experimental', icon: 'flask-conical' },
+];
+
+const fields = [
+  ...require('./resources'),
+  ...require('./jvm'),
+  ...require('./general'),
+  ...require('./world'),
+  ...require('./gameplay'),
+  ...require('./players'),
+  ...require('./network'),
+  ...require('./rcon'),
+  ...require('./packs'),
+  ...require('./autopause'),
+  ...require('./maintenance'),
+];
+
+const byKey = new Map(fields.map((f) => [`${f.scope}:${f.key}`, f]));
+
+function forSection(sectionId, mode = 'advanced') {
+  return fields.filter((f) => f.section === sectionId && !f.hidden && (mode === 'advanced' || f.mode === 'simple'));
+}
+
+function getField(scope, key) {
+  return byKey.get(`${scope}:${key}`) || null;
+}
+
+// Env-scope keys the Settings tab intentionally never renders because each has
+// its own channel: PVP/DIFFICULTY (live via World Controls) and MOTD (the
+// dedicated field above). Render-exclusion only - by contract every excluded
+// field is property-backed (`prop`), enforced by test, so whenever the panel
+// edits that property directly the env var is un-set and the edit wins over
+// the image re-asserting it on the next start. They are still fully
+// configurable at creation (the wizard renders them); they are only kept out
+// of the post-create Settings tab, which edits live values.
+const SETTINGS_EXCLUDED_ENV_KEYS = new Set(['DIFFICULTY', 'PVP', 'MOTD']);
+
+// server.properties key → env var name. Built from the catalog fields' `prop`,
+// so every property-backed env var is unlockable without a second hand-maintained
+// map anywhere.
+const propEnvMap = new Map(fields.filter((f) => f.prop).map((f) => [f.prop, f.key]));
+
+module.exports = {
+  SECTIONS,
+  fields,
+  forSection,
+  getField,
+  SETTINGS_EXCLUDED_ENV_KEYS,
+  propEnvMap,
+};

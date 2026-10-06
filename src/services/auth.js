@@ -1,0 +1,366 @@
+'use strict';
+
+// Users + credentials. bcryptjs hashes; roles admin/operator/viewer.
+
+const httpError = require('../utils/httpError');
+const bcrypt = require('bcryptjs');
+const { nanoid } = require('nanoid');
+const db = require('../db');
+const { recordEvent } = require('../events');
+const totp = require('./totp');
+const secrets = require('./secrets');
+const { AVATAR_PRESETS } = require('../config/avatars');
+
+const AVATAR_PRESET_KEYS = new Set(AVATAR_PRESETS.map((p) => p.key));
+
+// A real cost-11 bcrypt hash (of a throwaway string), compared against when the
+// username doesn't exist so the no-such-user path spends the same KDF time as a
+// wrong-password path - otherwise response timing leaks which usernames are
+// valid. Must stay a structurally valid hash; a malformed one makes
+// bcrypt.compareSync return immediately and defeats the purpose.
+const DUMMY_HASH = '$2b$11$wucCrrgG3m74Za/Ru1bUfOdSSuFU5RxA6GUOo9dGbc17Ym7vBt/lO';
+
+function firstRunNeeded() {
+  return !db.get('SELECT 1 AS x FROM users LIMIT 1');
+}
+
+// bcrypt work goes through the async API so a cost-11 hash (~100 ms of pure JS
+// in bcryptjs) yields the event loop in chunks instead of freezing every other
+// request - a login flood otherwise stalls the whole panel.
+const BCRYPT_COST = 11;
+
+async function createUser({ username, password, role = 'admin' }, { actor = 'system' } = {}) {
+  if (!/^[a-zA-Z0-9_.-]{2,32}$/.test(username))
+    throw httpError(400, 'A username must be 2 to 32 characters: letters, numbers, and _ . - only.');
+  if (typeof password !== 'string' || password.length < 8)
+    throw httpError(400, 'A password must be at least 8 characters.');
+  if (db.get('SELECT 1 AS x FROM users WHERE username = ?', username))
+    throw httpError(409, 'That username is already taken.');
+  const id = `usr_${nanoid(8)}`;
+  db.run(
+    'INSERT INTO users (id, username, password_hash, role) VALUES (?, ?, ?, ?)',
+    id,
+    username,
+    await bcrypt.hash(password, BCRYPT_COST),
+    role
+  );
+  recordEvent({ actor, type: 'user-created', summary: `User created: ${username} (${role}).` });
+  return getUser(id);
+}
+
+async function verifyCredentials(username, password) {
+  const user = db.get('SELECT * FROM users WHERE username = ?', username);
+  if (!user) {
+    await bcrypt.compare(password, DUMMY_HASH); // equalize timing with the real-user path
+    return null;
+  }
+  return (await bcrypt.compare(password, user.password_hash)) ? publicUser(user) : null;
+}
+
+function getUser(id) {
+  const user = db.get('SELECT * FROM users WHERE id = ?', id);
+  return user ? publicUser(user) : null;
+}
+
+function listUsers() {
+  return db.all('SELECT * FROM users ORDER BY created_at').map(publicUser);
+}
+
+/**
+ * Delete every session row for `userId` except `exceptSid` (the session
+ * performing the change, if any - so an admin resetting their own password,
+ * or a user rotating their own 2FA, isn't logged out by their own request).
+ * Called after any credential/2FA mutation so a stolen-but-still-valid
+ * session on another device can't survive the user actually fixing things.
+ */
+function revokeOtherSessions(userId, exceptSid = null) {
+  if (!userId) return;
+  if (exceptSid) {
+    db.run('DELETE FROM sessions WHERE user_id = ? AND sid != ?', userId, exceptSid);
+  } else {
+    db.run('DELETE FROM sessions WHERE user_id = ?', userId);
+  }
+}
+
+async function setPassword(id, password, { actor = 'system', exceptSid = null } = {}) {
+  if (typeof password !== 'string' || password.length < 8)
+    throw httpError(400, 'A password must be at least 8 characters.');
+  db.run('UPDATE users SET password_hash = ? WHERE id = ?', await bcrypt.hash(password, BCRYPT_COST), id);
+  revokeOtherSessions(id, exceptSid);
+  recordEvent({ actor, type: 'user-password-changed', summary: `Password changed for ${getUser(id)?.username}.` });
+}
+
+/**
+ * Admin password change with re-authentication. `actorId` is the acting admin's
+ * own id and `currentPassword` their current password - verified first, exactly
+ * like the account 2FA routes (confirmTotp/disableTotp), so a hijacked-but-live
+ * session can't mutate anyone's password without knowing the real one. The
+ * caller decides ``exceptSid``: when the target IS the acting admin they must
+ * pass null so the acting session is revoked too (it adopted the new password
+ * without re-verification through the login path).
+ */
+async function changePassword(
+  actorId,
+  targetId,
+  currentPassword,
+  newPassword,
+  { actor = 'system', exceptSid = null } = {}
+) {
+  if (typeof newPassword !== 'string' || newPassword.length < 8)
+    throw httpError(400, 'A password must be at least 8 characters.');
+  const acting = db.get('SELECT * FROM users WHERE id = ?', actorId);
+  if (!acting || !(await bcrypt.compare(String(currentPassword || ''), acting.password_hash))) {
+    throw httpError(401, 'That password is incorrect.');
+  }
+  if (!db.get('SELECT id FROM users WHERE id = ?', targetId)) throw httpError(404, 'User not found');
+  db.run('UPDATE users SET password_hash = ? WHERE id = ?', await bcrypt.hash(newPassword, BCRYPT_COST), targetId);
+  revokeOtherSessions(targetId, exceptSid);
+  recordEvent({
+    actor,
+    type: 'user-password-changed',
+    summary: `Password changed for ${getUser(targetId)?.username}.`,
+  });
+}
+
+function setRole(id, role, { actor = 'system' } = {}) {
+  if (!['admin', 'operator', 'viewer'].includes(role)) throw httpError(400, 'Pick a role: admin, operator, or viewer.');
+  const admins = db.get("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'").n;
+  const user = db.get('SELECT * FROM users WHERE id = ?', id);
+  if (user && user.role === 'admin' && role !== 'admin' && admins <= 1) {
+    throw httpError(409, "You can't change the last admin's role.");
+  }
+  db.run('UPDATE users SET role = ? WHERE id = ?', role, id);
+  recordEvent({ actor, type: 'user-role-changed', summary: `${user?.username} role → ${role}.` });
+}
+
+function deleteUser(id, { actor = 'system' } = {}) {
+  const user = db.get('SELECT * FROM users WHERE id = ?', id);
+  if (!user) return;
+  if (user.role === 'admin' && db.get("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'").n <= 1) {
+    throw httpError(409, "You can't delete the last admin account.");
+  }
+  db.run('DELETE FROM users WHERE id = ?', id);
+  recordEvent({ actor, type: 'user-deleted', summary: `User deleted: ${user.username}.` });
+}
+
+function publicUser(u) {
+  return {
+    id: u.id,
+    username: u.username,
+    role: u.role,
+    createdAt: u.created_at,
+    totpEnabled: Boolean(u.totp_enabled),
+    avatar: u.avatar || null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Profile picture. Self-service (any role, own account only) - see
+// web/routes/account.js for the preset/upload/clear endpoints and
+// web/routes/api.js for serving an uploaded image back. Uploaded files are
+// NOT cleaned up on user deletion, same accepted trade-off as custom server
+// icons (services/servers.js) - orphaned rather than adding delete-time
+// filesystem coupling here.
+
+/** Set a built-in preset avatar (one of config/avatars.js's AVATAR_PRESETS). */
+function setAvatarPreset(id, key, { actor = 'system' } = {}) {
+  if (!AVATAR_PRESET_KEYS.has(key)) throw httpError(400, "That profile picture option isn't recognized.");
+  const user = db.get('SELECT username FROM users WHERE id = ?', id);
+  if (!user) throw httpError(404, 'User not found');
+  db.run('UPDATE users SET avatar = ? WHERE id = ?', `preset:${key}`, id);
+  recordEvent({ actor, type: 'user-avatar-changed', summary: `${user.username} set a preset avatar.` });
+}
+
+/** Record an uploaded avatar file (the route has already validated + saved it to disk). */
+function setAvatarCustom(id, filename, { actor = 'system' } = {}) {
+  const user = db.get('SELECT username FROM users WHERE id = ?', id);
+  if (!user) throw httpError(404, 'User not found');
+  db.run('UPDATE users SET avatar = ? WHERE id = ?', `custom:${filename}`, id);
+  recordEvent({ actor, type: 'user-avatar-changed', summary: `${user.username} uploaded a custom avatar.` });
+}
+
+/** Revert to the default initial-letter avatar. */
+function clearAvatar(id, { actor = 'system' } = {}) {
+  const user = db.get('SELECT username FROM users WHERE id = ?', id);
+  if (!user) throw httpError(404, 'User not found');
+  db.run('UPDATE users SET avatar = NULL WHERE id = ?', id);
+  recordEvent({ actor, type: 'user-avatar-changed', summary: `${user.username} reset their avatar.` });
+}
+
+// ---------------------------------------------------------------------------
+// TOTP two-factor auth. Self-service (any role, acts on your own account) -
+// see web/routes/account.js - plus one admin recovery path in web/routes/api.js.
+// The secret is only ever written once a live code from it has been verified
+// (confirmTotp), so a setup a user never finishes leaves nothing persisted.
+
+/** Start enrollment: a fresh secret + otpauth URL, NOT persisted until confirmTotp(). */
+function beginTotpEnrollment(id) {
+  const user = db.get('SELECT username FROM users WHERE id = ?', id);
+  if (!user) throw httpError(404, 'User not found');
+  const secret = totp.generateSecret();
+  return { secret, otpauthUrl: totp.buildOtpauthUrl(secret, { account: user.username }) };
+}
+
+/** Verify the account password + the first live code, then persist the secret + backup codes. */
+async function confirmTotp(id, secret, code, password, { actor = 'system', exceptSid = null } = {}) {
+  const user = db.get('SELECT * FROM users WHERE id = ?', id);
+  if (!user) throw httpError(404, 'User not found');
+  if (user.totp_enabled) {
+    throw httpError(409, 'Two-factor authentication is already on. Turn it off first to set it up again.');
+  }
+  // Re-check the account's own password before ENABLING 2FA, exactly as disable
+  // and regenerate do. Without it, a hijacked-but-unlocked session (no password
+  // needed) could enroll the attacker's OWN authenticator on an account with no
+  // 2FA yet - locking the real owner out on their next login until an admin
+  // force-reset. The UI always sends the password; the API must not rely on that.
+  // Checked before the code so it can't double as a code-verification oracle.
+  if (!(await bcrypt.compare(password, user.password_hash))) throw httpError(401, 'That password is incorrect.');
+  if (totp.verify(secret, code) == null) {
+    throw httpError(400, 'That code is incorrect or has expired. Try the next one your app shows.');
+  }
+  const backupCodes = totp.generateBackupCodes();
+  const hashed = await Promise.all(backupCodes.map((c) => bcrypt.hash(c, BCRYPT_COST)));
+  // totp_last_step deliberately stays NULL here rather than recording this
+  // confirmation code's step: replay protection exists to stop a *login* code
+  // being reused, not to block the very first login from landing in the same
+  // 30s window as enrollment (a real code shown on-screen doesn't change until
+  // the window rolls over, so that first login legitimately reuses it).
+  db.run(
+    'UPDATE users SET totp_secret = ?, totp_enabled = 1, totp_backup_codes_json = ? WHERE id = ?',
+    secrets.encrypt(secret),
+    JSON.stringify(hashed),
+    id
+  );
+  // Enabling 2FA is a credential mutation like every other one (setPassword,
+  // disableTotp, regenerateBackupCodes all revoke too): any session that was
+  // trusted on the weaker password-only path must re-authenticate with 2FA.
+  revokeOtherSessions(id, exceptSid);
+  recordEvent({ actor, type: 'user-2fa-enabled', summary: `Two-factor authentication enabled for ${user.username}.` });
+  return { backupCodes };
+}
+
+/** Self-service disable - re-checks the account's own current password first. */
+async function disableTotp(id, password, { actor = 'system', exceptSid = null } = {}) {
+  const user = db.get('SELECT * FROM users WHERE id = ?', id);
+  if (!user) throw httpError(404, 'User not found');
+  if (!(await bcrypt.compare(password, user.password_hash))) throw httpError(401, 'That password is incorrect.');
+  db.run(
+    'UPDATE users SET totp_secret = NULL, totp_enabled = 0, totp_backup_codes_json = NULL, totp_last_step = NULL WHERE id = ?',
+    id
+  );
+  revokeOtherSessions(id, exceptSid);
+  recordEvent({
+    actor,
+    type: 'user-2fa-disabled',
+    summary: `Two-factor authentication disabled for ${user.username}.`,
+  });
+}
+
+/** Admin recovery path: force-disable another user's 2FA (lost phone + backup codes). */
+function adminDisableTotp(id, { actor = 'system' } = {}) {
+  const user = db.get('SELECT username, totp_enabled FROM users WHERE id = ?', id);
+  if (!user) throw httpError(404, 'User not found');
+  if (!user.totp_enabled) return;
+  db.run(
+    'UPDATE users SET totp_secret = NULL, totp_enabled = 0, totp_backup_codes_json = NULL, totp_last_step = NULL WHERE id = ?',
+    id
+  );
+  revokeOtherSessions(id);
+  recordEvent({
+    actor,
+    type: 'user-2fa-disabled',
+    summary: `Two-factor authentication reset for ${user.username} by an admin.`,
+  });
+}
+
+/** Re-check the password, then reissue backup codes (old ones stop working). */
+async function regenerateBackupCodes(id, password, { actor = 'system', exceptSid = null } = {}) {
+  const user = db.get('SELECT * FROM users WHERE id = ?', id);
+  if (!user) throw httpError(404, 'User not found');
+  if (!user.totp_enabled) throw httpError(400, 'Two-factor authentication is not turned on for this account.');
+  if (!(await bcrypt.compare(password, user.password_hash))) throw httpError(401, 'That password is incorrect.');
+  const backupCodes = totp.generateBackupCodes();
+  const hashed = await Promise.all(backupCodes.map((c) => bcrypt.hash(c, BCRYPT_COST)));
+  db.run('UPDATE users SET totp_backup_codes_json = ? WHERE id = ?', JSON.stringify(hashed), id);
+  revokeOtherSessions(id, exceptSid);
+  recordEvent({ actor, type: 'user-2fa-backup-codes', summary: `Backup codes regenerated for ${user.username}.` });
+  return { backupCodes };
+}
+
+/**
+ * Verify a login-time TOTP or backup code for `id` (the pendingTotpUserId from
+ * the first login step). Returns true/false; never throws on a bad code (the
+ * route layer handles lockout/messaging same as a wrong password).
+ */
+async function verifyTotpLogin(id, code) {
+  const user = db.get('SELECT * FROM users WHERE id = ? AND totp_enabled = 1', id);
+  if (!user || !user.totp_secret) return false;
+
+  const secret = secrets.tryDecrypt(user.totp_secret);
+  if (secret) {
+    const step = totp.verify(secret, code, { lastStep: user.totp_last_step });
+    if (step != null) {
+      db.run('UPDATE users SET totp_last_step = ? WHERE id = ?', step, id);
+      return true;
+    }
+  }
+
+  // Fall back to a backup code - single use, removed once matched.
+  let codes;
+  try {
+    codes = JSON.parse(user.totp_backup_codes_json || '[]');
+  } catch {
+    codes = [];
+  }
+  // Format gate BEFORE any bcrypt work. Backup codes are 10 hex chars split as
+  // xxxxx-xxxxx; a random/garbage guess here would otherwise pay a full
+  // bcrypt compare against every stored hash (~1s CPU) on each wrong attempt.
+  // The route already lockouts repeated failures, so this turns a blind spray
+  // into a zero-cost rejection while valid-looking guesses stay brute-force
+  // bounded by that lockout.
+  const cleanCode = String(code || '').trim();
+  if (!codes.length || !/^[0-9a-f]{5}-[0-9a-f]{5}$/i.test(cleanCode)) return false;
+  const matches = await Promise.all(codes.map((hash) => bcrypt.compare(cleanCode, hash)));
+  const idx = matches.findIndex(Boolean);
+  if (idx === -1) return false;
+  codes.splice(idx, 1);
+  db.run('UPDATE users SET totp_backup_codes_json = ? WHERE id = ?', JSON.stringify(codes), id);
+  recordEvent({
+    actor: user.username,
+    type: 'user-2fa-backup-used',
+    summary: `${user.username} signed in with a backup code (${codes.length} left).`,
+  });
+  return true;
+}
+
+/**
+ * Delete expired session rows. Lives here (service layer) rather than in the
+ * web-layer session store so the scheduler doesn't have to reach up into web/.
+ * expires_at is ISO-8601 ('…T…Z'); compare against the same ISO shape (a naive
+ * datetime('now') would always sort as less-than because 'T' > ' ').
+ */
+function pruneExpiredSessions() {
+  return db.run("DELETE FROM sessions WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')");
+}
+
+module.exports = {
+  firstRunNeeded,
+  createUser,
+  verifyCredentials,
+  getUser,
+  listUsers,
+  setPassword,
+  changePassword,
+  setRole,
+  deleteUser,
+  pruneExpiredSessions,
+  beginTotpEnrollment,
+  confirmTotp,
+  disableTotp,
+  adminDisableTotp,
+  regenerateBackupCodes,
+  verifyTotpLogin,
+  setAvatarPreset,
+  setAvatarCustom,
+  clearAvatar,
+};
