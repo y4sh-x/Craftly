@@ -106,7 +106,7 @@ Use it with:
 Host: YOUR_SERVER_IP
 Port: 2022
 Username: YOUR_CRAFTLY_USER
-
+```
 ## Release — Allocations
 
 Craftly now includes a persistent allocation registry tied to Docker nodes. Administrators can create TCP/UDP/both allocations, assign them to servers, release them, and delete only unassigned allocations. Allocation identity is unique per node/IP/port/protocol and server/node relationships are persisted in the panel database.
